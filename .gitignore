@@ -1,0 +1,15 @@
+# bytecode
+__pycache__/
+*.pyc
+
+# saída de testes (jsonl/db gerados pelo agente, engine e testbed)
+*.jsonl
+*.db
+resultados.jsonl
+decisao.jsonl
+fila_telemetria*.db
+telemetria.db
+
+# apresentação (binário grande, versionado à parte)
+*.pptx
+.~lock.*#
