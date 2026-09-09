@@ -202,9 +202,12 @@ def run_test(args, iface: str, rnd: int) -> dict:
     print(f"  [{iface}] ip={src_ip} sessão={session}")
 
     tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    tcp.settimeout(args.timeout)
+    # connect() com timeout curto (se houver): num link caído o SYN vira buraco
+    # negro e segurar --timeout inteiro (10s) por sondagem trava o failover.
+    tcp.settimeout(getattr(args, "connect_timeout", None) or args.timeout)
     bind_iface(tcp, iface, src_ip)
     tcp.connect((args.server, args.tcp_port))
+    tcp.settimeout(args.timeout)
     tcp.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     ctl = Conn(tcp)
 
@@ -333,6 +336,8 @@ def main():
     ap.add_argument("--pause", type=float, default=5.0,
                     help="pausa entre testes (deixa a rede assentar)")
     ap.add_argument("--timeout", type=float, default=20.0)
+    ap.add_argument("--connect-timeout", type=float, default=None,
+                    help="timeout só do connect() TCP (default: igual a --timeout)")
     ap.add_argument("--server-iface", default=None,
                     help="interface do servidor, só para coletar contadores dela")
     ap.add_argument("--out", default="resultados.jsonl")

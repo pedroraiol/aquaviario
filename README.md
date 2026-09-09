@@ -278,6 +278,13 @@ automaticamente quando um link piora.
   `decisao.jsonl`. Se `ip route replace` falhar, a engine registra
   `failover_falhou`/`ativacao_inicial_falhou` e continua tentando no ciclo
   seguinte, em vez de morrer.
+- A histerese vale para o caso "outro link parece um pouco melhor". Quando a
+  interface **ativa** simplesmente cai (timeout, sem resposta) por
+  `--fail-fast-rounds` ciclos seguidos, a engine troca na hora pro melhor
+  link que ainda responde, sem esperar `--margin`/`--hysteresis-rounds` —
+  fica registrado como `failover_rapido`. O `connect()` de cada sondagem
+  usa um timeout curto (`--connect-timeout`, 4 s) só pra detectar link
+  morto rápido, sem segurar o ciclo inteiro no `--timeout`.
 - O teste de vazão TCP da engine é **best-effort**: só roda a cada
   `--tcp-every` ciclos, é pulado quando a sondagem barata já mostrou o link
   degradado (RTT/perda altos), e se não terminar dentro do timeout as

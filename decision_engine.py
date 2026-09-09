@@ -140,6 +140,10 @@ def main():
     ap.add_argument("--resp-size", type=int, default=200)
     ap.add_argument("--drain", type=float, default=1.0)
     ap.add_argument("--timeout", type=float, default=10.0)
+    ap.add_argument("--connect-timeout", type=float, default=4.0,
+                    help="timeout só do connect() TCP de cada sondagem — curto de "
+                         "propósito: um link caído é detectado em segundos em vez "
+                         "de segurar o ciclo inteiro até o --timeout")
     ap.add_argument("--server-iface", default=None)
     ap.add_argument("--tcp-bytes", type=int, default=2 * 1024 * 1024,
                     help="bytes por sentido quando mede vazão (só a cada --tcp-every "
@@ -156,6 +160,12 @@ def main():
                     help="quanto o candidato precisa superar o ativo pra virar candidato a troca")
     ap.add_argument("--hysteresis-rounds", type=int, default=3,
                     help="por quantos ciclos seguidos o candidato precisa se manter à frente pra trocar")
+    ap.add_argument("--fail-fast-rounds", type=int, default=2,
+                    help="se a interface ATIVA falhar (timeout/sem resposta) por N "
+                         "ciclos seguidos, troca na hora pro melhor link que ainda "
+                         "responde, sem esperar --margin/--hysteresis-rounds "
+                         "(0 desativa; a histerese normal continua valendo pro caso "
+                         "'outro link parece um pouco melhor')")
     ap.add_argument("--log", default="decisao.jsonl")
     ap.add_argument("--telemetry-url", default=None,
                     help="ex.: http://10.99.0.1:8080/telemetria — se informado, cada "
@@ -179,6 +189,7 @@ def main():
     tput_cache: dict = {}
     streak = {i: 0 for i in ifaces}
     ativo = None
+    falhas_ativo = 0            # ciclos seguidos em que a interface ativa falhou
     rodada = 0
 
     with open(args.log, "a", buffering=1) as fh:
@@ -213,6 +224,13 @@ def main():
                 scores[iface] = compute_score(list(history[iface]))
 
             melhor = max(scores, key=lambda i: scores[i]["score"])
+            respondeu = {i: bool(history[i]) and history[i][-1].get("ok") for i in ifaces}
+
+            # a interface ativa falhou nesta rodada? (timeout / sem resposta)
+            if ativo is not None and not respondeu[ativo]:
+                falhas_ativo += 1
+            else:
+                falhas_ativo = 0
 
             if ativo is None:
                 if set_default_route(melhor, gateways.get(melhor)):
@@ -224,6 +242,24 @@ def main():
                     log_line(fh, {"ts_utc": datetime.now(timezone.utc).isoformat(),
                                   "rodada": rodada, "evento": "ativacao_inicial_falhou",
                                   "iface": melhor, "scores": scores})
+            elif (args.fail_fast_rounds > 0
+                  and falhas_ativo >= args.fail_fast_rounds
+                  and melhor != ativo and respondeu[melhor]):
+                # link ativo caiu de vez: troca já pro melhor link que ainda
+                # responde, sem esperar a histerese (que é pra ruído, não pra queda).
+                if set_default_route(melhor, gateways.get(melhor)):
+                    anterior, ativo = ativo, melhor
+                    streak = {i: 0 for i in ifaces}
+                    falhas_ativo = 0
+                    log_line(fh, {"ts_utc": datetime.now(timezone.utc).isoformat(),
+                                  "rodada": rodada, "evento": "failover_rapido",
+                                  "de": anterior, "para": ativo,
+                                  "motivo": f"ativo falhou {args.fail_fast_rounds}x seguidas",
+                                  "scores": scores})
+                else:
+                    log_line(fh, {"ts_utc": datetime.now(timezone.utc).isoformat(),
+                                  "rodada": rodada, "evento": "failover_falhou",
+                                  "para": melhor, "scores": scores})
             elif (melhor != ativo
                   and scores[melhor]["score"] - scores[ativo]["score"] >= args.margin):
                 streak[melhor] += 1
