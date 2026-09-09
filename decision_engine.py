@@ -33,7 +33,17 @@ from collections import deque
 from datetime import datetime, timezone
 
 from agent_rpi import run_test
-from score import score as compute_score
+from score import RTT_RUIM_MS, score as compute_score
+
+# um link cuja sondagem barata (RTT/perda) já está nesse patamar é
+# considerado degradado: não vale gastar um teste de vazão nele (caro, e
+# que TRAVA até o timeout num link ruim) nem reaproveitar a última vazão
+# boa que ficou na cache.
+DEGRAD_PERDA_PCT = 20.0
+
+
+def _link_degradado(rtt_p50, perda_total) -> bool:
+    return (perda_total or 0.0) > DEGRAD_PERDA_PCT or (rtt_p50 or 0.0) > RTT_RUIM_MS
 
 
 class _ArgsView:
@@ -56,32 +66,58 @@ def parse_gateways(s: str) -> dict:
     return out
 
 
-def resumo(result: dict, tput_cache: dict, iface: str) -> dict:
-    """Extrai do resultado do run_test() o formato que score.py espera."""
+def resumo(result: dict, tput_cache: dict, iface: str,
+           rodada: int, tcp_every: int) -> dict:
+    """Extrai do resultado do run_test() o formato que score.py espera.
+
+    tput_cache[iface] = (rodada_da_medicao, mbps). A vazão só é medida a
+    cada `tcp_every` rodadas; entre medições reaproveita a última — MAS só
+    se ela for recente (<= tcp_every rodadas) E o link não estiver
+    degradado agora. Assim um link que acabou de piorar não fica
+    "segurado" por um número de vazão velho e bom; passado o prazo a
+    vazão vira None e score.py renormaliza sem ela.
+    Uma medição tentada e falha (mbps_servidor=None) descarta o valor antigo.
+    """
     if "erro" in result:
         return {"ok": False}
     u = result.get("udp", {})
+    rtt_p50 = u.get("rtt_ms", {}).get("p50")
+    perda_total = u.get("perda_total_pct")
+
     subida = result.get("tcp_subida")
     tput = None
-    if subida and subida.get("mbps_servidor") is not None:
-        tput = subida["mbps_servidor"]
-        tput_cache[iface] = tput
-    if tput is None:
-        tput = tput_cache.get(iface)   # reaproveita a última medição de vazão
+    if subida is not None:
+        medido = subida.get("mbps_servidor")
+        if medido is not None:
+            tput = medido
+            tput_cache[iface] = (rodada, medido)
+        else:
+            tput_cache.pop(iface, None)      # mediu e falhou: não confia no valor antigo
+    if tput is None and not _link_degradado(rtt_p50, perda_total):
+        cache = tput_cache.get(iface)
+        if cache and rodada - cache[0] <= max(1, tcp_every):
+            tput = cache[1]
     return {
         "ok": True,
-        "rtt_p50_ms": u.get("rtt_ms", {}).get("p50"),
+        "rtt_p50_ms": rtt_p50,
         "jitter_ms": u.get("jitter_descida_ms"),
-        "perda_total_pct": u.get("perda_total_pct"),
+        "perda_total_pct": perda_total,
         "tput_mbps": tput,
     }
 
 
-def set_default_route(iface: str, gateway: str | None) -> None:
+def set_default_route(iface: str, gateway: str | None) -> bool:
     cmd = ["ip", "route", "replace", "default", "dev", iface]
     if gateway:
         cmd = ["ip", "route", "replace", "default", "via", gateway, "dev", iface]
-    subprocess.run(cmd, check=True)
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError) as e:
+        detalhe = (getattr(e, "stderr", "") or str(e)).strip()
+        print(f"  ! falha ao trocar rota default para {iface}: {detalhe}",
+              file=sys.stderr)
+        return False
 
 
 def log_line(fh, obj: dict) -> None:
@@ -105,8 +141,11 @@ def main():
     ap.add_argument("--drain", type=float, default=1.0)
     ap.add_argument("--timeout", type=float, default=10.0)
     ap.add_argument("--server-iface", default=None)
-    ap.add_argument("--tcp-bytes", type=int, default=4 * 1024 * 1024,
-                    help="bytes por sentido quando mede vazão (só a cada --tcp-every rodadas)")
+    ap.add_argument("--tcp-bytes", type=int, default=2 * 1024 * 1024,
+                    help="bytes por sentido quando mede vazão (só a cada --tcp-every "
+                         "rodadas). Menor que o do agent_rpi de propósito: aqui só "
+                         "precisa estimar a ordem de grandeza pro score, e um valor "
+                         "grande trava o ciclo até o timeout quando o link está ruim")
     ap.add_argument("--tcp-every", type=int, default=5,
                     help="mede vazão TCP a cada N rodadas por interface (0 desativa)")
     ap.add_argument("--interval", type=float, default=5.0,
@@ -149,10 +188,18 @@ def main():
             scores = {}
             for iface in ifaces:
                 testa_tput = args.tcp_every > 0 and rodada % args.tcp_every == 0
+                # se a sondagem barata anterior já mostrou o link degradado, não
+                # gasta um teste de vazão nele: a nota já vai sair baixa por
+                # RTT/perda e o teste só travaria o ciclo até o timeout.
+                ult = history[iface][-1] if history[iface] else None
+                if (testa_tput and ult and ult.get("ok")
+                        and _link_degradado(ult.get("rtt_p50_ms"),
+                                            ult.get("perda_total_pct"))):
+                    testa_tput = False
                 call_args = _ArgsView(args, args.tcp_bytes if testa_tput else 0)
                 try:
                     r = run_test(call_args, iface, rodada)
-                    resumo_r = resumo(r, tput_cache, iface)
+                    resumo_r = resumo(r, tput_cache, iface, rodada, args.tcp_every)
                 except Exception as e:
                     print(f"  ! {iface} falhou: {type(e).__name__}: {e}", file=sys.stderr)
                     r = {"ts_utc": datetime.now(timezone.utc).isoformat(),
@@ -168,24 +215,32 @@ def main():
             melhor = max(scores, key=lambda i: scores[i]["score"])
 
             if ativo is None:
-                ativo = melhor
-                set_default_route(ativo, gateways.get(ativo))
-                log_line(fh, {"ts_utc": datetime.now(timezone.utc).isoformat(),
-                              "rodada": rodada, "evento": "ativacao_inicial",
-                              "iface": ativo, "scores": scores})
-            elif melhor != ativo:
-                if scores[melhor]["score"] - scores[ativo]["score"] >= args.margin:
-                    streak[melhor] += 1
-                else:
-                    streak[melhor] = 0
-                if streak[melhor] >= args.hysteresis_rounds:
-                    anterior = ativo
+                if set_default_route(melhor, gateways.get(melhor)):
                     ativo = melhor
-                    set_default_route(ativo, gateways.get(ativo))
-                    streak = {i: 0 for i in ifaces}
                     log_line(fh, {"ts_utc": datetime.now(timezone.utc).isoformat(),
-                                  "rodada": rodada, "evento": "failover",
-                                  "de": anterior, "para": ativo, "scores": scores})
+                                  "rodada": rodada, "evento": "ativacao_inicial",
+                                  "iface": ativo, "scores": scores})
+                else:
+                    log_line(fh, {"ts_utc": datetime.now(timezone.utc).isoformat(),
+                                  "rodada": rodada, "evento": "ativacao_inicial_falhou",
+                                  "iface": melhor, "scores": scores})
+            elif (melhor != ativo
+                  and scores[melhor]["score"] - scores[ativo]["score"] >= args.margin):
+                streak[melhor] += 1
+                for i in ifaces:            # só um desafiante acumula streak por vez
+                    if i != melhor:
+                        streak[i] = 0
+                if streak[melhor] >= args.hysteresis_rounds:
+                    if set_default_route(melhor, gateways.get(melhor)):
+                        anterior, ativo = ativo, melhor
+                        streak = {i: 0 for i in ifaces}
+                        log_line(fh, {"ts_utc": datetime.now(timezone.utc).isoformat(),
+                                      "rodada": rodada, "evento": "failover",
+                                      "de": anterior, "para": ativo, "scores": scores})
+                    else:
+                        log_line(fh, {"ts_utc": datetime.now(timezone.utc).isoformat(),
+                                      "rodada": rodada, "evento": "failover_falhou",
+                                      "para": melhor, "scores": scores})
             else:
                 streak = {i: 0 for i in ifaces}
 

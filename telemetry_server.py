@@ -23,6 +23,7 @@ import html
 import json
 import sqlite3
 import threading
+from contextlib import closing
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -52,7 +53,7 @@ def init_db(path: str) -> None:
 
 def inserir(db_path: str, registro: dict) -> None:
     u = registro.get("udp", {}) or {}
-    with DB_LOCK, sqlite3.connect(db_path) as con:
+    with DB_LOCK, closing(sqlite3.connect(db_path)) as con, con:
         con.execute(
             """INSERT INTO telemetria
                (host, iface, rodada, rtt_p50_ms, jitter_ms,
@@ -72,7 +73,7 @@ def inserir(db_path: str, registro: dict) -> None:
 
 
 def ultimos(db_path: str, limit: int, iface: str | None) -> list[dict]:
-    with sqlite3.connect(db_path) as con:
+    with closing(sqlite3.connect(db_path)) as con:
         con.row_factory = sqlite3.Row
         if iface:
             rows = con.execute(
@@ -88,7 +89,7 @@ def ultimos(db_path: str, limit: int, iface: str | None) -> list[dict]:
 
 def idade_ultimo_registro_s(db_path: str) -> float | None:
     """Segundos desde o registro mais recente, ou None se o banco está vazio."""
-    with sqlite3.connect(db_path) as con:
+    with closing(sqlite3.connect(db_path)) as con:
         row = con.execute(
             "SELECT recebido_em FROM telemetria ORDER BY id DESC LIMIT 1"
         ).fetchone()

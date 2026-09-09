@@ -86,7 +86,10 @@ def main():
             if len(col("rtt_p50")) > 3 else None,
         })
 
-    resumo.sort(key=lambda r: (r["rtt_p50_mediano_ms"] is None, r["rtt_p50_mediano_ms"]))
+    # sem o `or 0.0`: quando 2+ interfaces não têm RTT válido, a chave vira
+    # (True, None) nas duas e o sort compara None < None -> TypeError.
+    resumo.sort(key=lambda r: (r["rtt_p50_mediano_ms"] is None,
+                               r["rtt_p50_mediano_ms"] or 0.0))
 
     cols = list(resumo[0].keys()) if resumo else []
     w = {c: max(len(c), *(len(str(r[c])) for r in resumo)) for c in cols}

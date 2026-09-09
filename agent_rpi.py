@@ -259,28 +259,43 @@ def run_test(args, iface: str, rnd: int) -> dict:
             if enviados else None,
         })
 
-        # --- fase 2: vazão TCP ----------------------------------------------
+        # --- fase 2: vazão TCP (opcional e NÃO-fatal) ----------------------
+        # um link muito ruim pode não terminar a transferência dentro do
+        # timeout do socket. Se isso acontecer o canal de controle fica
+        # inconsistente (bloco binário pela metade) e a sessão é abandonada
+        # — mas as métricas de latência/jitter/perda coletadas acima são
+        # preservadas e a rodada continua contando como sucesso.
+        fase2_ok = True
         if args.tcp_bytes > 0:
-            ctl.send_json({"cmd": "tcp_up", "bytes": args.tcp_bytes})
+            try:
+                ctl.send_json({"cmd": "tcp_up", "bytes": args.tcp_bytes})
+                ctl.recv_json()
+                t_up = ctl.send_bulk(args.tcp_bytes, BULK_BLOCK)
+                up = ctl.recv_json()
+                result["tcp_subida"] = {
+                    "mbps_servidor": up.get("mbps"),
+                    "mbps_agente": round(args.tcp_bytes * 8 / t_up / 1e6, 3) if t_up > 0 else None,
+                }
+
+                ctl.send_json({"cmd": "tcp_down", "bytes": args.tcp_bytes})
+                ack = ctl.recv_json()
+                n, secs = ctl.recv_exact_timed(int(ack["bytes"]))
+                down = ctl.recv_json()
+                result["tcp_descida"] = {
+                    "mbps_agente": round(n * 8 / secs / 1e6, 3) if secs > 0 else None,
+                    "segundos_servidor": down.get("segundos_servidor"),
+                }
+            except (OSError, ConnectionError, ValueError, KeyError) as e:
+                fase2_ok = False
+                result.setdefault("tcp_subida",
+                                  {"mbps_servidor": None,
+                                   "erro": f"{type(e).__name__}: {e}"})
+                print(f"  ! [{iface}] teste de vazão não completou "
+                      f"(métricas de latência preservadas): {e}", file=sys.stderr)
+
+        if fase2_ok:
+            ctl.send_json({"cmd": "bye"})
             ctl.recv_json()
-            t_up = ctl.send_bulk(args.tcp_bytes, BULK_BLOCK)
-            up = ctl.recv_json()
-            result["tcp_subida"] = {
-                "mbps_servidor": up.get("mbps"),
-                "mbps_agente": round(args.tcp_bytes * 8 / t_up / 1e6, 3) if t_up > 0 else None,
-            }
-
-            ctl.send_json({"cmd": "tcp_down", "bytes": args.tcp_bytes})
-            ack = ctl.recv_json()
-            n, secs = ctl.recv_exact_timed(int(ack["bytes"]))
-            down = ctl.recv_json()
-            result["tcp_descida"] = {
-                "mbps_agente": round(n * 8 / secs / 1e6, 3) if secs > 0 else None,
-                "segundos_servidor": down.get("segundos_servidor"),
-            }
-
-        ctl.send_json({"cmd": "bye"})
-        ctl.recv_json()
 
     finally:
         ctl.close()

@@ -6,7 +6,7 @@ Usado pelo decision_engine.py para decidir qual interface deve ser o
 caminho ativo. Não depende de rede nem dos outros módulos — só matemática
 em cima do histórico de rodadas, então é testável isolado.
 
-Três componentes, cada um 0-100 (100 = melhor):
+Componentes (cada um 0-100, 100 = melhor):
   qualidade    — RTT, jitter, perda e vazão de SUBIDA da amostra mais recente
                  (vazão de subida, não a média com descida: o caso de uso é
                  telemetria do Pi PARA o servidor, então é a subida que
@@ -14,6 +14,13 @@ Três componentes, cada um 0-100 (100 = melhor):
   estabilidade — o quanto a qualidade oscilou nas últimas N amostras
   penalidade   — falhas recentes (timeout, exceção, sem resposta); uma
                  falha AGORA pesa mais que uma falha há 5 rodadas
+
+A nota final é  qualidade * (W_QUALIDADE + W_ESTABILIDADE * estabilidade/100) - penalidade.
+A estabilidade ENTRA COMO FATOR sobre a qualidade, não como parcela somada:
+um link horrível porém constante não pode "ganhar pontos de graça" por ser
+estável (era o que fazia a nota de um link recém-degradado subir de novo
+depois de cair, à medida que a janela ia se enchendo de amostras ruins e
+parecidas entre si).
 """
 from __future__ import annotations
 
@@ -55,12 +62,22 @@ def _linear(v: float | None, bom: float, ruim: float) -> float:
 
 
 def qualidade_amostra(amostra: dict) -> float:
-    """amostra: {"rtt_p50_ms", "jitter_ms", "perda_total_pct", "tput_mbps"}"""
+    """amostra: {"rtt_p50_ms", "jitter_ms", "perda_total_pct", "tput_mbps"}
+
+    Se `tput_mbps` for None (a vazão só é medida a cada N rodadas — nas
+    demais o decision_engine manda None de propósito), a vazão é IGNORADA
+    e os outros três pesos são renormalizados. Antes, `tput_mbps` ausente
+    virava _linear(None)=0 e derrubava a nota em ~15 pontos toda rodada
+    que não media vazão — puro artefato, não degradação real do link.
+    """
     q_rtt = _linear(amostra.get("rtt_p50_ms"), RTT_BOM_MS, RTT_RUIM_MS)
     q_jit = _linear(amostra.get("jitter_ms"), JITTER_BOM_MS, JITTER_RUIM_MS)
     q_perda = _linear(amostra.get("perda_total_pct"), PERDA_BOM_PCT, PERDA_RUIM_PCT)
+    base = W_RTT * q_rtt + W_JITTER * q_jit + W_PERDA * q_perda
+    if amostra.get("tput_mbps") is None:
+        return base / (W_RTT + W_JITTER + W_PERDA)
     q_tput = _linear(amostra.get("tput_mbps"), TPUT_BOM_MBPS, TPUT_RUIM_MBPS)
-    return W_RTT * q_rtt + W_JITTER * q_jit + W_PERDA * q_perda + W_TPUT * q_tput
+    return base + W_TPUT * q_tput
 
 
 def estabilidade(qualidades: list[float]) -> float:
@@ -93,11 +110,19 @@ def score(historico: list[dict]) -> dict:
 
     oks = [h["ok"] for h in historico]
     qualidades = [qualidade_amostra(h) for h in historico if h["ok"]]
-    qualidade_atual = qualidades[-1] if qualidades else 0.0
+    if oks and not oks[-1]:
+        # a rodada mais recente falhou: a qualidade "atual" é 0, não a nota
+        # herdada da última rodada que deu certo (que podia ser ótima e
+        # deixava um link caído com nota alta enquanto a penalidade não
+        # somava o suficiente — era isso que fazia a nota oscilar pra cima
+        # logo depois de degradar).
+        qualidade_atual = 0.0
+    else:
+        qualidade_atual = qualidades[-1] if qualidades else 0.0
     estab = estabilidade(qualidades[-10:]) if qualidades else 0.0
     penal = penalidade_falhas(oks)
 
-    final = W_QUALIDADE * qualidade_atual + W_ESTABILIDADE * estab - penal
+    final = qualidade_atual * (W_QUALIDADE + W_ESTABILIDADE * estab / 100.0) - penal
     return {
         "score": round(max(0.0, min(100.0, final)), 2),
         "qualidade": round(qualidade_atual, 2),

@@ -1,5 +1,15 @@
 # netprobe — comparação de interfaces de rede entre Raspberry Pi e servidor
 
+Um Raspberry Pi embarcado tem Ethernet, Wi-Fi e um modem 4G ao mesmo tempo, e
+nenhum dos três é sempre o melhor caminho: a Ethernet só existe atracado, o
+Wi-Fi vai até a borda da marina e o 4G oscila conforme a embarcação se desloca.
+O netprobe mede os três enlaces continuamente — separando ida de volta, latência
+de perda — para que a decisão de qual interface carrega o tráfego seja tomada com
+número, e não no chute. A sondagem vem primeiro; em cima dela ficam o cálculo de
+nota (`score.py`) e o failover automático (`decision_engine.py`).
+
+O agente roda no Pi e um refletor roda no servidor do laboratório:
+
 ```
 Raspberry Pi (agente)                          Servidor do laboratório (refletor)
   eth0  ─┐                                       UDP 5000  reflete o pacote, carimba T2/T3
@@ -22,7 +32,7 @@ Raspberry Pi (agente)                          Servidor do laboratório (refleto
 | `telemetry_server.py` | servidor do lab | endpoint HTTP + banco (SQLite) + dashboard somente-leitura |
 | `testbed.sh` | qualquer uma | bancada sem hardware — namespaces simulando as 3 interfaces |
 
-nao precisa baixar nada, usa python padrao
+Não há nada para instalar: tudo roda com a biblioteca padrão do Python 3.
 
 ---
 
@@ -118,11 +128,12 @@ Parâmetros que valem ajustar:
 
 - `--count/--pps` — 1000 pacotes a 100 pps = 10 s de teste. Para caçar perda rara,
   aumentar `--count`, não `--pps`.
-- `--size/--resp-size` — testar em pelo menos dois tamanhos (ex.: 200 B e 1400 B).
-  Pacote pequeno mede latência do caminho; pacote grande revela serialização e
-  fragmentação. deve ficar **abaixo** do MTU menos 28 B (IP+UDP) para não fragmentar.
-- `--tcp-bytes 0` desativa a fase de vazão se você só quer latência.
-- `--pause` — deixar pelo menos 5 s entre testes para as filas esvaziarem.
+- `--size/--resp-size` — vale testar em pelo menos dois tamanhos (ex.: 200 B e
+  1400 B). O pacote pequeno mede a latência do caminho; o grande revela
+  serialização e fragmentação. O tamanho precisa ficar **abaixo** do MTU menos
+  28 B (IP+UDP) para não fragmentar.
+- `--tcp-bytes 0` desativa a fase de vazão, quando você só quer latência.
+- `--pause` — deixe pelo menos 5 s entre testes para as filas esvaziarem.
 
 ## 5. Analisar
 
@@ -176,19 +187,21 @@ No servidor, o mesmo padrão com `ExecStart=/usr/bin/python3 /opt/netprobe/refle
 ## Metodologia — o que estraga o experimento
 
 1. **Testar as interfaces em paralelo.** Elas competem por CPU e, no Pi, pelo mesmo
-   barramento USB (em modelos anteriores ao Pi 4, a Ethernet é USB). O agente é
-   sequencial de propósito.
-2. **Testar em bloco** (todo o eth0, depois todo o wlan0). mediria a hora do dia.
-   O rodízio já é feito, mas devemos rodar por 24 h para pegar horário de pico.
-3. **Ignorar a saturação de CPU.** Em Python, acima de ~2000 pps o Pi vira o gargalo e
-   não a rede. Acompanhar `loadavg` e o `proc_servidor_us`: se o processamento subir
-   junto com o RTT, o número é nosso, não da rede.
-4. **Só olhar a média.** Comparar p95/p99 e o IQR. para a maioria das aplicações,
-   um enlace de 30 ms estável ganha de um de 12 ms que às vezes vai a 400 ms.
+   barramento USB (em modelos anteriores ao Pi 4, a Ethernet é USB). Por isso o
+   agente é sequencial de propósito.
+2. **Testar em bloco** — todo o `eth0`, depois todo o `wlan0`. Isso mede a hora do
+   dia, não a interface. O rodízio entre rodadas já corrige isso, mas ainda vale
+   rodar por 24 h para pegar o horário de pico.
+3. **Ignorar a saturação de CPU.** Em Python, acima de ~2000 pps quem vira gargalo é
+   o Pi, não a rede. Vale acompanhar o `loadavg` e o `proc_servidor_us`: se o
+   processamento sobe junto com o RTT, o número é nosso, não do enlace.
+4. **Só olhar a média.** É preciso comparar também p95/p99 e o IQR — para a maioria
+   das aplicações, um enlace de 30 ms estável vale mais que um de 12 ms que de vez
+   em quando dispara para 400 ms.
 
 ## Bancada de testes sem hardware (`testbed.sh`)
 
-Validar o sistema sem o raspberry. O `testbed.sh` monta, em uma única máquina Linux, dois *network namespaces* ligados por três pares `veth`, cada um com um perfil de atraso/perda diferente:
+Dá para validar todo o sistema sem o Raspberry. O `testbed.sh` monta, numa única máquina Linux, dois *network namespaces* ligados por três pares `veth`, cada um com seu próprio perfil de atraso e perda:
 
 ```
 netns "rpi"                                   netns "lab"
@@ -230,7 +243,8 @@ kernel, nesse caso usar uma VM Linux de verdade.
 - **Os dois lados compartilham o mesmo relógio**, então `owd_ida_ms` e
   `owd_volta_ms` podem ser conferidos contra o valor exato que você pôs no `netem`.
   É a única situação em que você tem a resposta certa na mão.
-- Exercita o mesmo `SO_BINDTODEVICE` + `ip rule`/`ip route` que o Pi vai precisar. depura o roteamento antes de usar o raspberry.
+- Exercita o mesmo `SO_BINDTODEVICE` + `ip rule`/`ip route` que o Pi vai precisar,
+  então serve para depurar o roteamento antes de encostar no Raspberry.
 
 ### O que a bancada NÃO reproduz
 
@@ -247,11 +261,13 @@ decidir sozinho qual interface deve carregar o tráfego real, e trocar
 automaticamente quando um link piora.
 
 - **`score.py`** — puro, sem rede: transforma o histórico recente de uma
-  interface (RTT, jitter, perda total, vazão de *subida*) em uma nota 0-100,
-  combinando qualidade da amostra mais recente + estabilidade nas últimas
-  rodadas − penalidade por falhas recentes (decai com o tempo — uma falha
-  agora pesa mais que uma de 5 rodadas atrás). Testável isolado, sem Pi nem
-  bancada nenhuma.
+  interface (RTT, jitter, perda total, vazão de *subida*) em uma nota 0-100:
+  qualidade da amostra mais recente, **escalada** pela estabilidade das
+  últimas rodadas (0,7 a 1,0×), menos a penalidade por falhas recentes
+  (decai com o tempo — uma falha agora pesa mais que uma de 5 rodadas
+  atrás). A estabilidade multiplica em vez de somar de propósito: um link
+  ruim porém constante não ganha pontos de graça por ser estável. Testável
+  isolado, sem Pi nem bancada nenhuma.
 - **`decision_engine.py`** — roda no Pi ao lado do `agent_rpi.py`, reaproveita
   o mesmo `run_test()`. Cada ciclo sonda todas as interfaces, calcula o score
   de cada uma e, se o melhor link atual **não** é o ativo, só troca a rota
@@ -259,7 +275,17 @@ automaticamente quando um link piora.
   ficou à frente por `--margin` pontos durante `--hysteresis-rounds` ciclos
   seguidos — sem histerese o sistema fica trocando de link a cada rodada por
   ruído estatístico. Cada troca (e cada ciclo) fica registrada em
-  `decisao.jsonl`.
+  `decisao.jsonl`. Se `ip route replace` falhar, a engine registra
+  `failover_falhou`/`ativacao_inicial_falhou` e continua tentando no ciclo
+  seguinte, em vez de morrer.
+- O teste de vazão TCP da engine é **best-effort**: só roda a cada
+  `--tcp-every` ciclos, é pulado quando a sondagem barata já mostrou o link
+  degradado (RTT/perda altos), e se não terminar dentro do timeout as
+  métricas de latência/jitter/perda daquele ciclo continuam valendo (a
+  rodada não vira "falha"). Entre medições o score reaproveita a última
+  vazão conhecida só enquanto ela é recente e o link não piorou — assim um
+  link que acabou de degradar não fica com a nota "segurada" por um número
+  de vazão velho.
 - A sondagem continua testando **todas** as interfaces o tempo todo (bind
   explícito por socket, como sempre); só o tráfego comum da aplicação — que
   não faz esse bind — segue a rota default trocada pela engine. É assim que

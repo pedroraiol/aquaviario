@@ -222,7 +222,7 @@ decide() {
     ip netns exec rpi python3 "$DIR/decision_engine.py" \
         --server "$SERVER_IP" --ifaces eth0,wlan0,usb0 --gateways "$GW" \
         --interval "${INTERVAL:-3}" --count "${COUNT:-150}" --pps "${PPS:-100}" \
-        --tcp-every "${TCP_EVERY:-3}" --log "$OUT" \
+        --tcp-every "${TCP_EVERY:-3}" --tcp-bytes "${TCP_BYTES:-1048576}" --log "$OUT" \
         --telemetry-url "http://$SERVER_IP:$TELEMETRY_PORT/telemetria" \
         --telemetry-db /tmp/testbed_fila_engine.db
 
