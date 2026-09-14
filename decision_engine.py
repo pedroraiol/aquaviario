@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-decision_engine.py — roda no RASPBERRY PI, ao lado do agent_rpi.py.
+decision_engine.py: roda no RASPBERRY PI, ao lado do agent_rpi.py.
 
-Sonda as interfaces continuamente (reaproveita run_test() do agent_rpi.py —
+Sonda as interfaces continuamente (reaproveita run_test() do agent_rpi.py,
 mesmo protocolo, mesmo roteamento por interface), calcula um score por
 interface com score.py, e troca a rota default do sistema pra sempre
-apontar pro melhor link — COM histerese, pra não ficar trocando de rota
+apontar pro melhor link, COM histerese, pra não ficar trocando de rota
 a cada rodada por causa de ruído.
 
 A sondagem em si SEMPRE testa todas as interfaces, porque usa bind
 explícito por socket (SO_BINDTODEVICE + bind(src_ip), como no
-agent_rpi.py) — trocar a rota default só afeta o tráfego "normal" da
-aplicação, que não faz esse bind. É assim que dá pra continuar
+agent_rpi.py). Trocar a rota default só afeta o tráfego "normal" da
+aplicação, que não faz esse bind; é assim que dá pra continuar
 monitorando os links inativos enquanto um deles carrega o tráfego real.
 
 Uso:
@@ -47,22 +47,19 @@ def _link_degradado(rtt_p50, perda_total) -> bool:
 
 
 def checar_roteamento_politica(server: str, iface: str, gateway: str | None) -> str | None:
-    """Confere, ANTES de começar a sondar, se essa interface tem o roteamento
-    por política da seção 3 do README (ip rule + tabela por interface) —
-    sem isso, a sondagem bindada (SO_BINDTODEVICE) simplesmente não encontra
-    rota pro servidor e o sintoma vira um timeout genérico, difícil de
-    associar à causa real. Devolve None se está tudo certo, ou uma mensagem
-    de aviso pronta pra imprimir.
-    """
+    """Confere antes de sondar se a interface tem o roteamento por política
+    da seção 3 do README (ip rule + tabela por interface). Sem isso a
+    sondagem bindada não acha rota pro servidor e vira timeout genérico,
+    difícil de rastrear até a causa. None se estiver tudo certo."""
     if gateway is None:
         return (f"sem gateway em --gateways para {iface}; a rota default pra ela "
-                f"vai ser on-link (dev {iface}, sem via) — só funciona se o "
+                f"vai ser on-link (dev {iface}, sem via), só funciona se o "
                 f"destino estiver na mesma sub-rede. Pra um uplink de verdade "
                 f"(Ethernet/Wi-Fi/4G) isso normalmente está ERRADO; confira --gateways.")
     try:
         src_ip = iface_ipv4(iface)
     except OSError as e:
-        return f"não consegui ler o IP de {iface} ({e}) — ela está sem endereço?"
+        return f"não consegui ler o IP de {iface} ({e}); ela está sem endereço?"
     try:
         out = subprocess.run(
             ["ip", "route", "get", server, "from", src_ip, "oif", iface],
@@ -72,17 +69,17 @@ def checar_roteamento_politica(server: str, iface: str, gateway: str | None) -> 
         return f"não consegui checar a rota pra {server} saindo por {iface}: {e}"
     if out.returncode != 0:
         detalhe = (out.stderr or out.stdout).strip()
-        return (f"'ip route get {server} from {src_ip} oif {iface}' falhou: {detalhe} "
-                f"— falta a tabela/ip rule dessa interface (seção 3 do README)?")
+        return (f"'ip route get {server} from {src_ip} oif {iface}' falhou: {detalhe}. "
+                f"Falta a tabela/ip rule dessa interface (seção 3 do README)?")
     if f"dev {iface}" not in out.stdout:
         return (f"a rota pro servidor saindo de {src_ip} não usa {iface}: "
-                f"{out.stdout.strip()} — confira a prioridade das `ip rule`.")
+                f"{out.stdout.strip()}. Confira a prioridade das `ip rule`.")
     return None
 
 
 class _ArgsView:
     """Espelha o namespace de argumentos que run_test() espera, trocando
-    só tcp_bytes por rodada (pra não medir vazão toda hora — é caro)."""
+    só tcp_bytes por rodada, pra não medir vazão toda hora (é caro)."""
 
     def __init__(self, args: argparse.Namespace, tcp_bytes: int):
         self.__dict__.update(vars(args))
@@ -105,7 +102,7 @@ def resumo(result: dict, tput_cache: dict, iface: str,
     """Extrai do resultado do run_test() o formato que score.py espera.
 
     tput_cache[iface] = (rodada_da_medicao, mbps). A vazão só é medida a
-    cada `tcp_every` rodadas; entre medições reaproveita a última — MAS só
+    cada `tcp_every` rodadas; entre medições reaproveita a última, mas só
     se ela for recente (<= tcp_every rodadas) E o link não estiver
     degradado agora. Assim um link que acabou de piorar não fica
     "segurado" por um número de vazão velho e bom; passado o prazo a
@@ -160,7 +157,7 @@ def log_line(fh, obj: dict) -> None:
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Engine de decisão / failover — Raspberry Pi")
+    ap = argparse.ArgumentParser(description="Engine de decisão / failover, Raspberry Pi")
     ap.add_argument("--server", required=True)
     ap.add_argument("--ifaces", required=True)
     ap.add_argument("--gateways", default="",
@@ -175,7 +172,7 @@ def main():
     ap.add_argument("--drain", type=float, default=1.0)
     ap.add_argument("--timeout", type=float, default=10.0)
     ap.add_argument("--connect-timeout", type=float, default=4.0,
-                    help="timeout só do connect() TCP de cada sondagem — curto de "
+                    help="timeout só do connect() TCP de cada sondagem, curto de "
                          "propósito: um link caído é detectado em segundos em vez "
                          "de segurar o ciclo inteiro até o --timeout")
     ap.add_argument("--server-iface", default=None)
@@ -202,7 +199,7 @@ def main():
                          "'outro link parece um pouco melhor')")
     ap.add_argument("--log", default="decisao.jsonl")
     ap.add_argument("--telemetry-url", default=None,
-                    help="ex.: http://10.99.0.1:8080/telemetria — se informado, cada "
+                    help="ex.: http://10.99.0.1:8080/telemetria; se informado, cada "
                          "rodada também é enfileirada e enviada pro servidor de "
                          "telemetria (store-and-forward)")
     ap.add_argument("--telemetry-db", default="fila_telemetria_engine.db")
@@ -214,9 +211,9 @@ def main():
         print("aviso: sem root o SO_BINDTODEVICE e a troca de rota falham; use sudo.",
               file=sys.stderr)
 
-    # checagem de roteamento ANTES de começar: um erro de ip rule/tabela por
-    # interface (seção 3 do README) ou de gateway ausente vira, sem isso,
-    # um timeout genérico durante a sondagem — difícil de associar à causa.
+    # checa o roteamento antes de começar: sem isso, um erro de ip rule/tabela
+    # por interface ou gateway ausente só ia aparecer depois como timeout
+    # genérico na sondagem.
     for iface in ifaces:
         problema = checar_roteamento_politica(args.server, iface, gateways.get(iface))
         if problema:
@@ -235,7 +232,7 @@ def main():
     rodada = 0
 
     with open(args.log, "a", buffering=1) as fh:
-        print(f"engine de decisão — interfaces: {ifaces}", file=sys.stderr)
+        print(f"engine de decisão, interfaces: {ifaces}", file=sys.stderr)
         while True:
             rodada += 1
             scores = {}
@@ -324,10 +321,9 @@ def main():
 
             print(f"[{rodada}] ativo={ativo}  " +
                   "  ".join(f"{i}={scores[i]['score']}" for i in ifaces))
-            # "entradas" = as métricas cruas de cada interface nessa rodada
-            # (o que entrou no compute_score) — grava pra dar pra recalcular
-            # o score offline com outros pesos depois, sem reprocessar a
-            # bancada inteira. Ver calibrar_pesos.py.
+            # "entradas" grava o que entrou no compute_score (não só o
+            # resultado), pra dar pra recalcular com outro peso depois sem
+            # reprocessar a bancada inteira; ver calibrar_pesos.py.
             log_line(fh, {"ts_utc": datetime.now(timezone.utc).isoformat(),
                           "rodada": rodada, "evento": "status", "ativo": ativo,
                           "scores": scores,

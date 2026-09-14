@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-analisar.py — consolida o resultados.jsonl e compara as interfaces.
+analisar.py: consolida o resultados.jsonl e compara as interfaces.
 
     python3 analisar.py resultados.jsonl
     python3 analisar.py resultados.jsonl --csv resumo.csv
@@ -101,7 +101,7 @@ def main():
         print("  ".join(str(r[c]).ljust(w[c]) for c in cols))
 
     print("\nLeitura: RTT e jitter menores são melhores; vazão maior é melhor.")
-    print("estab_rtt_iqr_ms = dispersão do RTT entre rodadas — quanto menor, mais previsível o enlace.")
+    print("estab_rtt_iqr_ms = dispersão do RTT entre rodadas, quanto menor mais previsível o enlace.")
 
     if args.csv and resumo:
         with open(args.csv, "w", newline="") as f:

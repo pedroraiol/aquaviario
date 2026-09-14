@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """
-score.py — combina as métricas de um enlace num único número (0-100).
+score.py: combina as métricas de um enlace num único número (0-100).
 
 Usado pelo decision_engine.py para decidir qual interface deve ser o
-caminho ativo. Não depende de rede nem dos outros módulos — só matemática
+caminho ativo. Não depende de rede nem dos outros módulos, só matemática
 em cima do histórico de rodadas, então é testável isolado.
 
 Componentes (cada um 0-100, 100 = melhor):
-  qualidade    — RTT, jitter, perda e vazão de SUBIDA da amostra mais recente
-                 (vazão de subida, não a média com descida: o caso de uso é
-                 telemetria do Pi PARA o servidor, então é a subida que
-                 importa se o link está fraco num sentido só)
-  estabilidade — o quanto a qualidade oscilou nas últimas N amostras
-  penalidade   — falhas recentes (timeout, exceção, sem resposta); uma
-                 falha AGORA pesa mais que uma falha há 5 rodadas
+  qualidade:    RTT, jitter, perda e vazão de SUBIDA da amostra mais recente
+                (vazão de subida, não a média com descida: o caso de uso é
+                telemetria do Pi PARA o servidor, então é a subida que
+                importa se o link está fraco num sentido só)
+  estabilidade: o quanto a qualidade oscilou nas últimas N amostras
+  penalidade:   falhas recentes (timeout, exceção, sem resposta); uma
+                falha AGORA pesa mais que uma falha há 5 rodadas
 
 A nota final é  qualidade * (W_QUALIDADE + W_ESTABILIDADE * estabilidade/100) - penalidade.
 A estabilidade ENTRA COMO FATOR sobre a qualidade, não como parcela somada:
@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import statistics as st
 
-# thresholds "bom"/"ruim" por métrica — em `bom` a nota já é 100, em
+# thresholds "bom"/"ruim" por métrica: em `bom` a nota já é 100, em
 # `ruim` a nota já é 0, linear entre os dois. Calibrados para um cenário
 # de telemetria embarcada (não para um datacenter): 20ms de RTT já é ótimo.
 RTT_BOM_MS, RTT_RUIM_MS = 20.0, 300.0
@@ -66,16 +66,14 @@ def qualidade_amostra(amostra: dict, *, w_rtt: float = W_RTT,
                       w_tput: float = W_TPUT) -> float:
     """amostra: {"rtt_p50_ms", "jitter_ms", "perda_total_pct", "tput_mbps"}
 
-    Se `tput_mbps` for None (a vazão só é medida a cada N rodadas — nas
+    Se `tput_mbps` for None (a vazão só é medida a cada N rodadas, nas
     demais o decision_engine manda None de propósito), a vazão é IGNORADA
     e os outros três pesos são renormalizados. Antes, `tput_mbps` ausente
     virava _linear(None)=0 e derrubava a nota em ~15 pontos toda rodada
-    que não media vazão — puro artefato, não degradação real do link.
+    que não media vazão, um artefato puro, não degradação real do link.
 
-    Os pesos têm default = constantes do módulo (W_RTT etc.); os parâmetros
-    só existem pra permitir explorar outras combinações offline, veja
-    `calibrar_pesos.py`. Chamado sem argumentos extras, o comportamento é
-    idêntico ao de antes.
+    Os `w_*` são opcionais e default pras constantes do módulo, só dão
+    pra trocar quando alguém quer testar outra combinação (`calibrar_pesos.py`).
     """
     q_rtt = _linear(amostra.get("rtt_p50_ms"), RTT_BOM_MS, RTT_RUIM_MS)
     q_jit = _linear(amostra.get("jitter_ms"), JITTER_BOM_MS, JITTER_RUIM_MS)
@@ -116,12 +114,10 @@ def score(historico: list[dict], *, w_rtt: float = W_RTT,
     """
     historico: lista de rodadas, da mais antiga pra mais recente, cada uma
       {"ok": bool, "rtt_p50_ms":..., "jitter_ms":..., "perda_total_pct":..., "tput_mbps":...}
-    (quando "ok" é False as outras chaves podem faltar — foi timeout/erro.)
+    (quando "ok" é False as outras chaves podem faltar, foi timeout/erro.)
 
-    Os `w_*` têm default = constantes do módulo; só existem pra permitir
-    recalcular o score com outra combinação de pesos sem mexer no módulo
-    (usado por `calibrar_pesos.py`). Chamado sem argumentos extras, o
-    comportamento é idêntico ao de antes.
+    Os `w_*` são pra quem quer recalcular com outros pesos sem editar o
+    módulo (é o que o `calibrar_pesos.py` faz); default = as constantes lá em cima.
     """
     if not historico:
         return {"score": 0.0, "qualidade": 0.0, "estabilidade": 100.0, "penalidade": 0.0}
@@ -134,7 +130,7 @@ def score(historico: list[dict], *, w_rtt: float = W_RTT,
         # a rodada mais recente falhou: a qualidade "atual" é 0, não a nota
         # herdada da última rodada que deu certo (que podia ser ótima e
         # deixava um link caído com nota alta enquanto a penalidade não
-        # somava o suficiente — era isso que fazia a nota oscilar pra cima
+        # somava o suficiente; era isso que fazia a nota oscilar pra cima
         # logo depois de degradar).
         qualidade_atual = 0.0
     else:

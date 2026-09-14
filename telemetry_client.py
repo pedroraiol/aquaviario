@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-telemetry_client.py — fila local (SQLite) + envio pro telemetry_server.py
+telemetry_client.py: fila local (SQLite) + envio pro telemetry_server.py
 do laboratório. Store-and-forward: se o servidor estiver inalcançável, o
 registro fica na fila e é reenviado nos próximos ciclos, na ordem em que
-chegou — pra não perder justamente os dados do momento em que o link caiu.
+chegou. Assim não perde justamente os dados do momento em que o link caiu.
 
 Usado pelo agent_rpi.py e pelo decision_engine.py; não depende de nada
 além da stdlib.
@@ -46,8 +46,8 @@ class Fila:
         return self.con.execute("SELECT COUNT(*) FROM fila WHERE enviado = 0").fetchone()[0]
 
     def esvaziar(self, max_itens: int = 50) -> int:
-        """Envia os pendentes em ordem. Para no primeiro erro — o servidor
-        provavelmente ainda está fora, tenta de novo no próximo ciclo em
+        """Envia os pendentes em ordem. Para no primeiro erro, porque o servidor
+        provavelmente ainda está fora; tenta de novo no próximo ciclo em
         vez de martelar o resto da fila. Retorna quantos foram enviados."""
         linhas = self.con.execute(
             "SELECT id, payload FROM fila WHERE enviado = 0 ORDER BY id ASC LIMIT ?",

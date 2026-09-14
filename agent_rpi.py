@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-agent_rpi.py — roda no RASPBERRY PI.
+agent_rpi.py: roda no RASPBERRY PI.
 
 Para cada interface, em rodízio entre as rodadas:
   1. abre o canal de controle TCP amarrado àquela interface;
@@ -57,7 +57,7 @@ def bind_iface(sock: socket.socket, iface: str, src_ip: str | None = None) -> No
                         iface.encode() + b"\x00")
     except PermissionError:
         print(f"  ! sem permissão para SO_BINDTODEVICE em {iface} "
-              f"(rode com sudo) — caindo para bind() por IP apenas",
+              f"(rode com sudo), caindo para bind() por IP apenas",
               file=sys.stderr)
     if src_ip:
         sock.bind((src_ip, 0))
@@ -96,7 +96,7 @@ def link_info(iface: str) -> dict:
 
 
 def pi_system_metrics() -> dict:
-    """Carga, memória e temperatura do próprio Pi — pra distinguir degradação
+    """Carga, memória e temperatura do próprio Pi. Serve pra distinguir degradação
     do enlace de saturação do agente (ver Metodologia no README: 'se o
     processamento sobe junto com o RTT, o número é nosso, não do enlace').
     Simétrico ao `system_metrics()` do reflector_server.py, mas sem depender
@@ -186,11 +186,11 @@ def udp_test(sock, session, count, pps, size, resp_size, drain_s):
 
 def analyze_replies(replies, sent_count):
     rtts, owd_fwd, owd_rev, offsets = [], [], [], []
-    jit_rtt = Jitter()       # variação do RTT completo (ida+volta) — era chamado
-                              # (errado) de "jitter_descida"; útil, mas não isola a perna
-    jit_descida = Jitter()   # variação só da perna servidor->Pi (T4_real-T3);
-                              # offset de relógio constante cancela na diferença,
-                              # igual ao jitter_subida_ms que o servidor já calcula
+    # RTT completo (ida+volta). Isso aqui era chamado, errado, de "jitter_descida"
+    jit_rtt = Jitter()
+    # só a perna servidor->Pi (T4_real-T3); o offset de relógio constante
+    # cancela na diferença, igual o jitter_subida_ms que o servidor já calcula
+    jit_descida = Jitter()
     seen, reordered, max_seq = set(), 0, -1
 
     for p in sorted(replies, key=lambda r: r["t4_mono"]):
@@ -301,8 +301,8 @@ def run_test(args, iface: str, rnd: int) -> dict:
         # --- fase 2: vazão TCP (opcional e NÃO-fatal) ----------------------
         # um link muito ruim pode não terminar a transferência dentro do
         # timeout do socket. Se isso acontecer o canal de controle fica
-        # inconsistente (bloco binário pela metade) e a sessão é abandonada
-        # — mas as métricas de latência/jitter/perda coletadas acima são
+        # inconsistente (bloco binário pela metade) e a sessão é abandonada,
+        # mas as métricas de latência/jitter/perda coletadas acima ficam
         # preservadas e a rodada continua contando como sucesso.
         fase2_ok = True
         if args.tcp_bytes > 0:
@@ -354,7 +354,7 @@ def print_line(r: dict) -> None:
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Agente de medição — Raspberry Pi")
+    ap = argparse.ArgumentParser(description="Agente de medição, Raspberry Pi")
     ap.add_argument("--server", required=True, help="IP/host do servidor do laboratório")
     ap.add_argument("--ifaces", required=True,
                     help="lista separada por vírgula, ex.: eth0,wlan0,usb0")
@@ -378,7 +378,7 @@ def main():
                     help="interface do servidor, só para coletar contadores dela")
     ap.add_argument("--out", default="resultados.jsonl")
     ap.add_argument("--telemetry-url", default=None,
-                    help="ex.: http://10.99.0.1:8080/telemetria — se informado, cada "
+                    help="ex.: http://10.99.0.1:8080/telemetria; se informado, cada "
                          "resultado também é enfileirado e enviado pro servidor de "
                          "telemetria (store-and-forward, não bloqueia se ele estiver fora)")
     ap.add_argument("--telemetry-db", default="fila_telemetria.db",

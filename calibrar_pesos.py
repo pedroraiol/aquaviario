@@ -1,31 +1,26 @@
 #!/usr/bin/env python3
 """
-calibrar_pesos.py — dá um jeito EXPERIMENTAL de escolher os pesos de
-score.py, em vez de aceitar os valores "calibrados a olho" (comentário
-original do score.py) que estavam lá.
+calibrar_pesos.py: testa os pesos de score.py contra o gabarito do
+testbed.sh, em vez de confiar nos valores "calibrados a olho" que já
+estavam lá.
 
-Ideia: os perfis de rede do testbed.sh (`IFACE_CFG`) são um gabarito
-conhecido — eth0 é sempre o melhor, wlan0 o do meio, usb0 o pior (ver
-README, seção "Bancada"). Rodando `sudo ./testbed.sh decide` num cenário
-SEM `flap` (as três interfaces no perfil original), qualquer combinação de
-pesos "correta" tem que ranquear eth0 > wlan0 > usb0 na maioria das
-rodadas. Este script varre uma grade de combinações de pesos, recalcula o
-score OFFLINE em cima de um `decisao.jsonl` já gravado (usa o campo
-"entradas" — métricas cruas por interface e por rodada, que o
-decision_engine.py passou a gravar justamente pra viabilizar isto) e
-reporta qual combinação separa melhor o gabarito.
+Os perfis do testbed.sh (IFACE_CFG) são fixos: sem flap, eth0 é sempre
+melhor que wlan0, que é sempre melhor que usb0. Isso dá um gabarito pra
+testar peso. Deixa o decision_engine.py rodando sem flap por uns
+minutos, recalcula o score com um monte de combinações de peso diferentes
+em cima do decisao.jsonl gravado (ele já traz as métricas cruas de cada
+rodada em "entradas") e mostra qual combinação acerta o ranking com mais
+folga.
 
 Uso:
-    sudo ./testbed.sh decide &      # deixa rodando SEM flap por ~1-2 min
-    # depois Ctrl+C (ou 'kill') no processo do decide
+    sudo ./testbed.sh decide &      # sem flap, uns 1-2 min bastam
+    kill %1
     python3 calibrar_pesos.py /tmp/testbed_decisao.jsonl \
         --esperado eth0,wlan0,usb0
 
-Isto NÃO substitui validação com dado de campo real (a bancada não
-reproduz rádio Wi-Fi, handover de 4G, contenção de USB etc. — ver README,
-"O que a bancada NÃO reproduz"). É um primeiro filtro objetivo pra
-descartar combinações de peso ruins e ter um ponto de partida melhor que
-"chute calibrado" antes de gastar tempo de campo no Pi real.
+Isso é só um filtro inicial pra descartar combinação ruim de peso. A
+bancada não reproduz rádio Wi-Fi, handover de 4G nem contenção de USB
+(ver README). Não troca peso de verdade sem confirmar com dado de campo.
 """
 from __future__ import annotations
 
@@ -59,8 +54,8 @@ def historico_ate(rodadas: list[dict], indice: int, iface: str, janela: int) -> 
 def concordancia(rodadas: list[dict], esperado: list[str], janela: int,
                  pesos: dict) -> tuple[float, float]:
     """Fração de rodadas em que o ranking do score bate com `esperado`
-    (melhor->pior) e a margem média entre 1º e 2º colocado (separação —
-    quanto maior, mais robusto o ranking é a ruído estatístico)."""
+    (melhor->pior) e a margem média entre 1º e 2º colocado (separação:
+    quanto maior, mais robusto o ranking fica a ruído estatístico)."""
     acertos, margens, total = 0, [], 0
     for idx in range(len(rodadas)):
         notas = {}
@@ -120,9 +115,8 @@ def main():
     rodadas = carregar_entradas(args.log)
     if not rodadas:
         raise SystemExit(
-            "nenhuma rodada com 'entradas' encontrada em " + args.log + " — esse "
-            "campo só existe em logs gravados depois da atualização do "
-            "decision_engine.py que acrescentou essa gravação; rode de novo.")
+            f"nenhuma rodada com 'entradas' em {args.log}. Grave o log de "
+            f"novo com a versão atual do decision_engine.py.")
     print(f"{len(rodadas)} rodadas carregadas de {args.log}")
 
     atuais = {"w_rtt": W_RTT, "w_jitter": W_JITTER, "w_perda": W_PERDA,
@@ -141,10 +135,8 @@ def main():
     for ac, mg, pesos in resultados[:args.top]:
         print(f"  acerto={ac:.1%}  margem_media={mg:.2f}  {pesos}")
 
-    print("\nlembrete: isto só valida contra o gabarito determinístico da "
-          "bancada (netem). Não troque os pesos de score.py só com base "
-          "nisso sem também checar com dado de campo real do Pi — a bancada "
-          "não reproduz rádio, handover de 4G nem contenção de USB.")
+    print("\nisso só vale contra o gabarito fixo da bancada. Confirme com "
+          "dado de campo do Pi antes de mudar peso de verdade.")
 
 
 if __name__ == "__main__":

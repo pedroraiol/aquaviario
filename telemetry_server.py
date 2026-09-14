@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-telemetry_server.py — endpoint HTTP + banco no servidor do laboratório.
+telemetry_server.py: endpoint HTTP + banco no servidor do laboratório.
 
 Recebe os resultados que o Pi envia (mesmo formato JSON que o
 agent_rpi.py/decision_engine.py já gravam localmente), grava num SQLite,
 e serve um painel HTML somente-leitura. Roda ao lado do
-reflector_server.py — são coisas diferentes: o reflector mede o enlace,
+reflector_server.py, mas são coisas diferentes: o reflector mede o enlace,
 este aqui guarda o que foi medido.
 
     POST /telemetria   corpo = um registro JSON (um round de um agente)
@@ -118,14 +118,14 @@ def dashboard_html(db_path: str) -> str:
     )
     refresh_tag = '<meta http-equiv="refresh" content="5">' if ativo else ""
     if ativo:
-        status = "🟢 recebendo dados ao vivo — atualiza sozinho a cada 5s"
+        status = "🟢 recebendo dados ao vivo, atualiza sozinho a cada 5s"
     elif idade is None:
-        status = "⏸ parado — nenhum registro ainda"
+        status = "⏸ parado, nenhum registro ainda"
     else:
-        status = f"⏸ parado — sem registro novo há {int(idade)}s"
+        status = f"⏸ parado, sem registro novo há {int(idade)}s"
     return f"""<!doctype html>
 <html><head><meta charset="utf-8">{refresh_tag}
-<title>netprobe — telemetria</title>
+<title>aquaviario: telemetria</title>
 <style>
 body {{ font-family: monospace; margin: 2rem; }}
 table {{ border-collapse: collapse; }}
@@ -133,8 +133,8 @@ td, th {{ border: 1px solid #999; padding: 4px 8px; text-align: right; }}
 th {{ background: #eee; }}
 </style></head>
 <body>
-<h1>netprobe — últimos registros recebidos</h1>
-<p>{status} — {len(linhas)} registros mostrados (mais recente primeiro)
+<h1>aquaviario: últimos registros recebidos</h1>
+<p>{status}, {len(linhas)} registros mostrados (mais recente primeiro)
 <a href="/">atualizar</a></p>
 <table>
 <tr><th>recebido</th><th>host</th><th>iface</th><th>rodada</th>
@@ -194,7 +194,7 @@ class Server(ThreadingHTTPServer):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Endpoint de telemetria + banco — servidor do laboratório")
+        description="Endpoint de telemetria + banco, servidor do laboratório")
     ap.add_argument("--bind", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--db", default="telemetria.db")

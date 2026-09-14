@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# testbed.sh — bancada sem hardware para o netprobe.
+# testbed.sh: bancada sem hardware para o aquaviario.
 #
 # Monta dois network namespaces ("rpi" e "lab") ligados por três pares veth,
 # cada um com um perfil de atraso/perda diferente via netem, e exercita a
@@ -25,7 +25,7 @@
 #                                      # pra ver a engine reagir enquanto "decide" está rodando
 #   sudo ./testbed.sh down            # derruba refletor/telemetria e remove tudo
 #
-# O dashboard (http://10.99.0.1:8080/) fica no ar do 'up' até o 'down' —
+# O dashboard (http://10.99.0.1:8080/) fica no ar do 'up' até o 'down',
 # sobrevive a quantos 'run'/'decide' você quiser rodar no meio.
 #
 # Requisitos: iproute2 e o módulo sch_netem (pacote linux-modules-extra em
@@ -37,12 +37,12 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SERVER_IP=10.99.0.1
 TELEMETRY_PORT=8080
 # rota default inicial no rpi (existe num Pi real antes de qualquer ip rule
-# por política; sem ela, tráfego "normal" — como a telemetria — não tem
+# por política; sem ela, tráfego "normal" (como a telemetria) não tem
 # por onde sair. A decision_engine substitui isso pelo melhor link.
 DEFAULT_DEV=eth0
 DEFAULT_VIA=10.0.1.2
 # link só de administração, ligando o SEU Linux real (fora de qualquer
-# namespace) direto ao netns "lab" — só pra abrir o dashboard num navegador
+# namespace) direto ao netns "lab", só pra abrir o dashboard num navegador
 # de verdade. Não é usado pela sondagem (que continua isolada em eth0/wlan0/usb0).
 MGMT_HOST_IP=10.0.9.1
 MGMT_LAB_IP=10.0.9.2
@@ -113,17 +113,17 @@ up() {
     ip netns exec lab ip link set to-mgmt up
     ip route add "$SERVER_IP/32" via "$MGMT_LAB_IP" dev mgmt0 2>/dev/null || true
 
-    # filtro de caminho reverso frouxo no rpi — necessário com 3 rotas para o mesmo destino
+    # filtro de caminho reverso frouxo no rpi, necessário com 3 rotas para o mesmo destino
     ip netns exec rpi sysctl -qw net.ipv4.conf.all.rp_filter=2
     ip netns exec rpi sysctl -qw net.ipv4.conf.default.rp_filter=2
 
-    # rota default na tabela principal — existe num Pi real antes de qualquer
+    # rota default na tabela principal, existe num Pi real antes de qualquer
     # configuração de multi-homing; sem ela tráfego sem bind (telemetria, etc)
     # não tem por onde sair. A decision_engine substitui isso pelo melhor link.
     ip netns exec rpi ip route add default via "$DEFAULT_VIA" dev "$DEFAULT_DEV"
 
     # refletor + telemetria sobem AQUI, uma vez só, e ficam no ar até o
-    # 'down' — igual ao servidor do laboratório de verdade, que não reinicia
+    # 'down', igual ao servidor do laboratório de verdade, que não reinicia
     # a cada rodada de teste. 'run'/'decide' só usam o que já está no ar.
     rm -f /tmp/testbed_telemetria.db
     ip netns exec lab python3 "$DIR/reflector_server.py" --bind "$SERVER_IP" \
@@ -135,7 +135,7 @@ up() {
 
     echo "bancada no ar. servidor em $SERVER_IP, alcançável pelos 3 caminhos."
     echo "refletor e telemetria no ar (ficam até o 'down')."
-    echo "dashboard: http://$SERVER_IP:$TELEMETRY_PORT/  — abra direto no seu navegador"
+    echo "dashboard: http://$SERVER_IP:$TELEMETRY_PORT/  abra direto no seu navegador"
 }
 
 down() {
@@ -143,7 +143,7 @@ down() {
     # 'decide'/'run' de uma sessão anterior que não foi parado com Ctrl+C
     # deixa processos presos num namespace que "ip netns del" só torna
     # invisível (o kernel mantém vivo enquanto houver processo referenciando
-    # ele) — mata isso antes, senão o namespace vira fantasma.
+    # ele). Mata isso antes, senão o namespace vira fantasma.
     local PRESOS
     PRESOS=$(pgrep -f "python3 $DIR/(reflector_server|telemetry_server|decision_engine|agent_rpi)\.py" 2>/dev/null || true)
     if [[ -n "$PRESOS" ]]; then
@@ -193,7 +193,7 @@ run() {
     local OUT=/tmp/testbed_resultados.jsonl
     rm -f "$OUT"
 
-    echo "rodando agente em rpi (eth0,wlan0,usb0) — usando o refletor/telemetria do 'up'..."
+    echo "rodando agente em rpi (eth0,wlan0,usb0), usando o refletor/telemetria do 'up'..."
     ip netns exec rpi python3 "$DIR/agent_rpi.py" \
         --server "$SERVER_IP" --ifaces eth0,wlan0,usb0 \
         --rounds "${ROUNDS:-3}" --count "${COUNT:-300}" --pps "${PPS:-150}" \
@@ -216,7 +216,7 @@ decide() {
     rm -f "$OUT"
 
     local GW="eth0=10.0.1.2,wlan0=10.0.2.2,usb0=10.0.3.2"
-    echo "rodando engine de decisão em rpi — Ctrl+C pra parar (refletor/telemetria do 'up' continuam no ar depois)."
+    echo "rodando engine de decisão em rpi, Ctrl+C pra parar (refletor/telemetria do 'up' continuam no ar depois)."
     echo "em outro terminal: sudo ./testbed.sh flap wlan0 bad   (pra ver o failover reagir)"
     echo "                    abra http://$SERVER_IP:$TELEMETRY_PORT/  no seu navegador (dashboard ao vivo)"
     ip netns exec rpi python3 "$DIR/decision_engine.py" \

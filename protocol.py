@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-protocol.py — formato de pacote e utilitários comuns ao agente (Raspberry Pi)
+protocol.py: formato de pacote e utilitários comuns ao agente (Raspberry Pi)
 e ao refletor (servidor do laboratório).
 
 colocar esse codigo nas duas maquinas

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-reflector_server.py — roda no SERVIDOR DO LABORATÓRIO.
+reflector_server.py: roda no SERVIDOR DO LABORATÓRIO.
 
 Duas portas:
   UDP  5000  refletor: recebe o pacote de teste, carimba T2/T3, devolve com
@@ -45,8 +45,8 @@ class SessionState:
         self.first_arrival = None
         self.last_arrival = None
         self.jitter = Jitter()
-        self.transits = []        # T2 - T1 (ns) — só é válido com relógios sincronizados
-        self.proc_times = []      # T3 - T2 (ns) — custo interno do servidor
+        self.transits = []        # T2 - T1 (ns), só vale com relógios sincronizados
+        self.proc_times = []      # T3 - T2 (ns), custo interno do servidor
 
     def on_packet(self, seq: int, t1: int, t2: int, size: int) -> None:
         with self.lock:
@@ -88,7 +88,7 @@ class SessionState:
 
 
 def system_metrics(iface: str | None = None) -> dict:
-    """'Métricas do servidor' — carga, memória e contadores da NIC."""
+    """'Métricas do servidor': carga, memória e contadores da NIC."""
     out: dict = {"hostname": socket.gethostname(), "ts": now_ns()}
     try:
         out["loadavg"] = os.getloadavg()
@@ -234,7 +234,7 @@ class ControlServer(socketserver.ThreadingTCPServer):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Refletor de medição — servidor do laboratório")
+    ap = argparse.ArgumentParser(description="Refletor de medição, servidor do laboratório")
     ap.add_argument("--bind", default="0.0.0.0")
     ap.add_argument("--udp-port", type=int, default=5000)
     ap.add_argument("--tcp-port", type=int, default=5001)
