@@ -62,7 +62,7 @@ def inserir(db_path: str, registro: dict) -> None:
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 registro.get("host"), registro.get("iface"), registro.get("rodada"),
-                (u.get("rtt_ms") or {}).get("p50"), u.get("jitter_descida_ms"),
+                (u.get("rtt_ms") or {}).get("p50"), u.get("jitter_rtt_ms"),
                 u.get("perda_ida_pct"), u.get("perda_volta_pct"), u.get("perda_total_pct"),
                 (registro.get("tcp_subida") or {}).get("mbps_servidor"),
                 (registro.get("tcp_descida") or {}).get("mbps_agente"),

@@ -61,7 +61,9 @@ def _linear(v: float | None, bom: float, ruim: float) -> float:
         return 100.0 * (v - ruim) / (bom - ruim)
 
 
-def qualidade_amostra(amostra: dict) -> float:
+def qualidade_amostra(amostra: dict, *, w_rtt: float = W_RTT,
+                      w_jitter: float = W_JITTER, w_perda: float = W_PERDA,
+                      w_tput: float = W_TPUT) -> float:
     """amostra: {"rtt_p50_ms", "jitter_ms", "perda_total_pct", "tput_mbps"}
 
     Se `tput_mbps` for None (a vazão só é medida a cada N rodadas — nas
@@ -69,15 +71,23 @@ def qualidade_amostra(amostra: dict) -> float:
     e os outros três pesos são renormalizados. Antes, `tput_mbps` ausente
     virava _linear(None)=0 e derrubava a nota em ~15 pontos toda rodada
     que não media vazão — puro artefato, não degradação real do link.
+
+    Os pesos têm default = constantes do módulo (W_RTT etc.); os parâmetros
+    só existem pra permitir explorar outras combinações offline, veja
+    `calibrar_pesos.py`. Chamado sem argumentos extras, o comportamento é
+    idêntico ao de antes.
     """
     q_rtt = _linear(amostra.get("rtt_p50_ms"), RTT_BOM_MS, RTT_RUIM_MS)
     q_jit = _linear(amostra.get("jitter_ms"), JITTER_BOM_MS, JITTER_RUIM_MS)
     q_perda = _linear(amostra.get("perda_total_pct"), PERDA_BOM_PCT, PERDA_RUIM_PCT)
-    base = W_RTT * q_rtt + W_JITTER * q_jit + W_PERDA * q_perda
+    base = w_rtt * q_rtt + w_jitter * q_jit + w_perda * q_perda
     if amostra.get("tput_mbps") is None:
-        return base / (W_RTT + W_JITTER + W_PERDA)
+        peso_restante = w_rtt + w_jitter + w_perda
+        # combinação de pesos com tudo em w_tput e a amostra sem vazão: não
+        # sobra nenhum sinal pra formar a nota dessa rodada.
+        return base / peso_restante if peso_restante > 0 else 0.0
     q_tput = _linear(amostra.get("tput_mbps"), TPUT_BOM_MBPS, TPUT_RUIM_MBPS)
-    return base + W_TPUT * q_tput
+    return base + w_tput * q_tput
 
 
 def estabilidade(qualidades: list[float]) -> float:
@@ -99,17 +109,27 @@ def penalidade_falhas(janela_ok: list[bool]) -> float:
     return penal
 
 
-def score(historico: list[dict]) -> dict:
+def score(historico: list[dict], *, w_rtt: float = W_RTT,
+          w_jitter: float = W_JITTER, w_perda: float = W_PERDA,
+          w_tput: float = W_TPUT, w_qualidade: float = W_QUALIDADE,
+          w_estabilidade: float = W_ESTABILIDADE) -> dict:
     """
     historico: lista de rodadas, da mais antiga pra mais recente, cada uma
       {"ok": bool, "rtt_p50_ms":..., "jitter_ms":..., "perda_total_pct":..., "tput_mbps":...}
     (quando "ok" é False as outras chaves podem faltar — foi timeout/erro.)
+
+    Os `w_*` têm default = constantes do módulo; só existem pra permitir
+    recalcular o score com outra combinação de pesos sem mexer no módulo
+    (usado por `calibrar_pesos.py`). Chamado sem argumentos extras, o
+    comportamento é idêntico ao de antes.
     """
     if not historico:
         return {"score": 0.0, "qualidade": 0.0, "estabilidade": 100.0, "penalidade": 0.0}
 
     oks = [h["ok"] for h in historico]
-    qualidades = [qualidade_amostra(h) for h in historico if h["ok"]]
+    qualidades = [qualidade_amostra(h, w_rtt=w_rtt, w_jitter=w_jitter,
+                                    w_perda=w_perda, w_tput=w_tput)
+                  for h in historico if h["ok"]]
     if oks and not oks[-1]:
         # a rodada mais recente falhou: a qualidade "atual" é 0, não a nota
         # herdada da última rodada que deu certo (que podia ser ótima e
@@ -122,7 +142,7 @@ def score(historico: list[dict]) -> dict:
     estab = estabilidade(qualidades[-10:]) if qualidades else 0.0
     penal = penalidade_falhas(oks)
 
-    final = qualidade_atual * (W_QUALIDADE + W_ESTABILIDADE * estab / 100.0) - penal
+    final = qualidade_atual * (w_qualidade + w_estabilidade * estab / 100.0) - penal
     return {
         "score": round(max(0.0, min(100.0, final)), 2),
         "qualidade": round(qualidade_atual, 2),

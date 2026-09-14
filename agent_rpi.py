@@ -95,6 +95,35 @@ def link_info(iface: str) -> dict:
     return info
 
 
+def pi_system_metrics() -> dict:
+    """Carga, memória e temperatura do próprio Pi — pra distinguir degradação
+    do enlace de saturação do agente (ver Metodologia no README: 'se o
+    processamento sobe junto com o RTT, o número é nosso, não do enlace').
+    Simétrico ao `system_metrics()` do reflector_server.py, mas sem depender
+    dele (roda em máquinas diferentes)."""
+    out: dict = {}
+    try:
+        out["loadavg"] = os.getloadavg()
+    except OSError:
+        pass
+    try:
+        with open("/proc/meminfo") as f:
+            mem = {}
+            for line in f:
+                k, _, v = line.partition(":")
+                if k in ("MemTotal", "MemAvailable"):
+                    mem[k] = int(v.split()[0])
+        out["mem_kb"] = mem
+    except OSError:
+        pass
+    try:
+        with open("/sys/class/thermal/thermal_zone0/temp") as f:
+            out["cpu_temp_c"] = round(int(f.read().strip()) / 1000.0, 1)
+    except (OSError, ValueError):
+        pass
+    return out
+
+
 # ----------------------------------------------------------------------------
 # Teste UDP: pacote de teste -> reflexão com métricas
 # ----------------------------------------------------------------------------
@@ -157,7 +186,11 @@ def udp_test(sock, session, count, pps, size, resp_size, drain_s):
 
 def analyze_replies(replies, sent_count):
     rtts, owd_fwd, owd_rev, offsets = [], [], [], []
-    jit = Jitter()
+    jit_rtt = Jitter()       # variação do RTT completo (ida+volta) — era chamado
+                              # (errado) de "jitter_descida"; útil, mas não isola a perna
+    jit_descida = Jitter()   # variação só da perna servidor->Pi (T4_real-T3);
+                              # offset de relógio constante cancela na diferença,
+                              # igual ao jitter_subida_ms que o servidor já calcula
     seen, reordered, max_seq = set(), 0, -1
 
     for p in sorted(replies, key=lambda r: r["t4_mono"]):
@@ -169,7 +202,8 @@ def analyze_replies(replies, sent_count):
         owd_fwd.append(fwd)
         owd_rev.append(rev)
         offsets.append((fwd - rev) / 2.0)        # offset estimado entre relógios
-        jit.update(p["t4_mono"] - p["t1_mono"])
+        jit_rtt.update(p["t4_mono"] - p["t1_mono"])
+        jit_descida.update(rev)
         if p["seq"] < max_seq:
             reordered += 1
         max_seq = max(max_seq, p["seq"])
@@ -186,7 +220,8 @@ def analyze_replies(replies, sent_count):
         "unicas": len(seen),
         "fora_de_ordem": reordered,
         "rtt_ms": summarize(rtts),
-        "jitter_descida_ms": round(jit.ms, 4),
+        "jitter_rtt_ms": round(jit_rtt.ms, 4),
+        "jitter_descida_ms": round(jit_descida.ms, 4),
         "offset_relogios_ms": round(offset_ns / 1e6, 3),
         "owd_ida_ms": summarize([v - offset_ns for v in owd_fwd]),
         "owd_volta_ms": summarize([v + offset_ns for v in owd_rev]),
@@ -219,6 +254,7 @@ def run_test(args, iface: str, rnd: int) -> dict:
                    "req_size": args.size, "resp_size": args.resp_size,
                    "tcp_bytes": args.tcp_bytes},
         "link_antes": link_info(iface),
+        "pi_sistema": pi_system_metrics(),
     }
 
     try:
@@ -311,7 +347,7 @@ def print_line(r: dict) -> None:
     u = r.get("udp", {})
     rtt = u.get("rtt_ms", {})
     print(f"    RTT p50={rtt.get('p50')}ms p95={rtt.get('p95')}ms  "
-          f"jitter={u.get('jitter_descida_ms')}ms  "
+          f"jitter={u.get('jitter_rtt_ms')}ms  "
           f"perda ida/volta={u.get('perda_ida_pct')}/{u.get('perda_volta_pct')}%  "
           f"TCP ↑{(r.get('tcp_subida') or {}).get('mbps_servidor')} "
           f"↓{(r.get('tcp_descida') or {}).get('mbps_agente')} Mbps")

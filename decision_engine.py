@@ -32,7 +32,7 @@ import time
 from collections import deque
 from datetime import datetime, timezone
 
-from agent_rpi import run_test
+from agent_rpi import iface_ipv4, run_test
 from score import RTT_RUIM_MS, score as compute_score
 
 # um link cuja sondagem barata (RTT/perda) já está nesse patamar é
@@ -44,6 +44,40 @@ DEGRAD_PERDA_PCT = 20.0
 
 def _link_degradado(rtt_p50, perda_total) -> bool:
     return (perda_total or 0.0) > DEGRAD_PERDA_PCT or (rtt_p50 or 0.0) > RTT_RUIM_MS
+
+
+def checar_roteamento_politica(server: str, iface: str, gateway: str | None) -> str | None:
+    """Confere, ANTES de começar a sondar, se essa interface tem o roteamento
+    por política da seção 3 do README (ip rule + tabela por interface) —
+    sem isso, a sondagem bindada (SO_BINDTODEVICE) simplesmente não encontra
+    rota pro servidor e o sintoma vira um timeout genérico, difícil de
+    associar à causa real. Devolve None se está tudo certo, ou uma mensagem
+    de aviso pronta pra imprimir.
+    """
+    if gateway is None:
+        return (f"sem gateway em --gateways para {iface}; a rota default pra ela "
+                f"vai ser on-link (dev {iface}, sem via) — só funciona se o "
+                f"destino estiver na mesma sub-rede. Pra um uplink de verdade "
+                f"(Ethernet/Wi-Fi/4G) isso normalmente está ERRADO; confira --gateways.")
+    try:
+        src_ip = iface_ipv4(iface)
+    except OSError as e:
+        return f"não consegui ler o IP de {iface} ({e}) — ela está sem endereço?"
+    try:
+        out = subprocess.run(
+            ["ip", "route", "get", server, "from", src_ip, "oif", iface],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return f"não consegui checar a rota pra {server} saindo por {iface}: {e}"
+    if out.returncode != 0:
+        detalhe = (out.stderr or out.stdout).strip()
+        return (f"'ip route get {server} from {src_ip} oif {iface}' falhou: {detalhe} "
+                f"— falta a tabela/ip rule dessa interface (seção 3 do README)?")
+    if f"dev {iface}" not in out.stdout:
+        return (f"a rota pro servidor saindo de {src_ip} não usa {iface}: "
+                f"{out.stdout.strip()} — confira a prioridade das `ip rule`.")
+    return None
 
 
 class _ArgsView:
@@ -100,7 +134,7 @@ def resumo(result: dict, tput_cache: dict, iface: str,
     return {
         "ok": True,
         "rtt_p50_ms": rtt_p50,
-        "jitter_ms": u.get("jitter_descida_ms"),
+        "jitter_ms": u.get("jitter_rtt_ms"),
         "perda_total_pct": perda_total,
         "tput_mbps": tput,
     }
@@ -179,6 +213,14 @@ def main():
     if os.geteuid() != 0:
         print("aviso: sem root o SO_BINDTODEVICE e a troca de rota falham; use sudo.",
               file=sys.stderr)
+
+    # checagem de roteamento ANTES de começar: um erro de ip rule/tabela por
+    # interface (seção 3 do README) ou de gateway ausente vira, sem isso,
+    # um timeout genérico durante a sondagem — difícil de associar à causa.
+    for iface in ifaces:
+        problema = checar_roteamento_politica(args.server, iface, gateways.get(iface))
+        if problema:
+            print(f"aviso: {iface}: {problema}", file=sys.stderr)
 
     fila = None
     if args.telemetry_url:
@@ -282,8 +324,14 @@ def main():
 
             print(f"[{rodada}] ativo={ativo}  " +
                   "  ".join(f"{i}={scores[i]['score']}" for i in ifaces))
+            # "entradas" = as métricas cruas de cada interface nessa rodada
+            # (o que entrou no compute_score) — grava pra dar pra recalcular
+            # o score offline com outros pesos depois, sem reprocessar a
+            # bancada inteira. Ver calibrar_pesos.py.
             log_line(fh, {"ts_utc": datetime.now(timezone.utc).isoformat(),
-                          "rodada": rodada, "evento": "status", "ativo": ativo, "scores": scores})
+                          "rodada": rodada, "evento": "status", "ativo": ativo,
+                          "scores": scores,
+                          "entradas": {i: history[i][-1] for i in ifaces}})
 
             time.sleep(args.interval)
 

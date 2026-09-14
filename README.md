@@ -149,7 +149,8 @@ python3 analisar.py resultados.jsonl --csv resumo.csv --por-teste-csv bruto.csv
 |---|---|
 | `rtt_ms` | `(T4−T1) − (T3−T2)`, com T1/T4 em relógio **monotônico**, imune a ajuste de NTP no meio do teste |
 | `owd_ida_ms` / `owd_volta_ms` | `T2−T1` e `T4−T3` em relógio de parede, corrigidos pelo offset estimado |
-| `jitter_descida_ms` | jitter interarrival da RFC 3550, `J += (|D(i)−D(i−1)| − J)/16` |
+| `jitter_rtt_ms` | jitter interarrival da RFC 3550 sobre o RTT completo (ida+volta), `J += (\|D(i)−D(i−1)\| − J)/16` |
+| `jitter_descida_ms` | o mesmo cálculo, mas só sobre a perna servidor→Pi (`T4_real−T3`); simétrico ao `jitter_subida_ms` que o servidor já calcula sobre `T2−T1` |
 | `perda_ida_pct` | `(enviados − recebidos_pelo_servidor) / enviados` |
 | `perda_volta_pct` | `(recebidos_pelo_servidor − respostas_recebidas) / recebidos_pelo_servidor` |
 | `proc_servidor_us` | `T3−T2`, o custo interno do refletor, já descontado do RTT |
@@ -193,7 +194,8 @@ No servidor, o mesmo padrão com `ExecStart=/usr/bin/python3 /opt/netprobe/refle
    dia, não a interface. O rodízio entre rodadas já corrige isso, mas ainda vale
    rodar por 24 h para pegar o horário de pico.
 3. **Ignorar a saturação de CPU.** Em Python, acima de ~2000 pps quem vira gargalo é
-   o Pi, não a rede. Vale acompanhar o `loadavg` e o `proc_servidor_us`: se o
+   o Pi, não a rede. Cada rodada já grava `pi_sistema` (loadavg, memória,
+   temperatura da CPU) ao lado de `servidor_sistema`/`proc_servidor_us`: se o
    processamento sobe junto com o RTT, o número é nosso, não do enlace.
 4. **Só olhar a média.** É preciso comparar também p95/p99 e o IQR — para a maioria
    das aplicações, um enlace de 30 ms estável vale mais que um de 12 ms que de vez
@@ -313,9 +315,17 @@ sudo python3 decision_engine.py --server 10.99.0.1 \
 ```
 
 No Pi real, `--gateways` leva os gateways de verdade de cada interface
-(mesmos IPs usados na seção 3). Ainda não implementado: persistir o estado
-entre reinícios do processo — ele sempre começa sem link ativo e escolhe o
-melhor da primeira rodada.
+(mesmos IPs usados na seção 3). Ao iniciar, a engine confere pra cada
+interface se existe rota funcional pro servidor saindo por ela
+(`ip route get <server> from <ip_da_iface> oif <iface>`) e se há gateway
+configurado — sem isso, avisa alto no `stderr` em vez de deixar o problema
+aparecer só como timeout genérico durante a sondagem. Interface sem
+gateway em `--gateways` ainda funciona (rota default vira on-link), mas
+isso só é correto se o destino estiver na mesma sub-rede — pra Ethernet/
+Wi-Fi/4G reais, sempre informe o gateway.
+
+Ainda não implementado: persistir o estado entre reinícios do processo —
+ele sempre começa sem link ativo e escolhe o melhor da primeira rodada.
 
 ## Banco de telemetria e store-and-forward
 
