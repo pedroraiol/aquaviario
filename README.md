@@ -1,12 +1,7 @@
-# aquaviario: comparação de interfaces de rede entre Raspberry Pi e servidor
+# Aquaviário: comparação de interfaces de rede entre Raspberry Pi e servidor
 
-Um Raspberry Pi embarcado tem Ethernet, Wi-Fi e um modem 4G ao mesmo tempo, e
-nenhum dos três é sempre o melhor caminho: a Ethernet só existe atracado, o
-Wi-Fi vai até a borda da marina e o 4G oscila conforme a embarcação se desloca.
-O aquaviario mede os três enlaces continuamente, separando ida de volta e latência
-de perda, para que a decisão de qual interface carrega o tráfego seja tomada com
-número, e não no chute. A sondagem vem primeiro; em cima dela ficam o cálculo de
-nota (`score.py`) e o failover automático (`decision_engine.py`).
+Um Raspberry Pi embarcado tem Ethernet, Wi-Fi e um modem 4G ao mesmo tempo, e nenhum dos três é sempre o melhor caminho: a Ethernet só existe atracado, o Wi-Fi vai até a borda da marina e o 4G oscila conforme a embarcação se desloca.
+O projeto se propõe a medir os três enlaces continuamente, separando ida de volta e latência de perda, para que a decisão de qual interface carrega o tráfego seja tomada com base na qualidade do sinal. A sondagem vem primeiro; em cima dela ficam o cálculo de nota (`score.py`) e o failover automático (`decision_engine.py`).
 
 O agente roda no Pi e um refletor roda no servidor do laboratório:
 
@@ -22,32 +17,24 @@ Raspberry Pi (agente)                          Servidor do laboratório (refleto
 
 Toda rodada testa uma interface de cada vez, sempre na mesma sequência:
 
-1. O Pi abre uma conexão de controle TCP com o servidor (porta 5001) e avisa
-   que vai começar uma rodada de UDP. É nesse momento que o servidor passa a
-   contar as estatísticas daquela sessão.
-2. O Pi dispara os pacotes de teste por UDP, um de cada vez numa taxa fixa.
+1. O Raspberry Pi abre uma conexão de controle TCP com o servidor (porta 5001) e avisa que vai começar uma rodada de UDP. Neste momento, o servidor passa a contar as estatísticas daquela sessão.
+2. O Raspberry Pi dispara os pacotes de teste por UDP, um de cada vez numa taxa fixa.
    Cada pacote carrega o instante em que foi enviado (T1, medido no relógio
-   monotônico do Pi).
+   monotônico do Raspberry Pi).
 3. O servidor recebe cada pacote e carimba o instante de chegada (T2); logo
    antes de devolver a reflexão, carimba também o instante de envio da
    resposta (T3).
-4. A resposta volta ao Pi com T1 (o mesmo que ele mandou), T2 e T3 dentro do
-   pacote. O Pi marca o instante de chegada dessa resposta (T4) e já calcula
-   o RTT daquele pacote na hora, como `(T4−T1) − (T3−T2)`: o tempo total de
-   ida e volta, descontando quanto o pacote ficou parado sendo processado
+4. A resposta volta ao Raspberry Pi com T1 (o mesmo que ele mandou), T2 e T3 dentro do pacote. O Raspberry Pi marca o instante de chegada dessa resposta (T4) e já calcula
+   o RTT daquele pacote na hora, como `(T4−T1) − (T3−T2)`: o tempo total de ida e volta, descontando quanto o pacote ficou parado sendo processado
    dentro do servidor.
-5. Depois do último pacote (e de uma pequena espera pelos retardatários), o
-   Pi encerra o socket UDP e avisa o fim da rodada pelo canal de controle.
-6. Só então o servidor calcula e devolve as métricas do lado dele: quantos
-   pacotes recebeu, jitter e atraso de ida vistos por ele, entre outras. São
-   números que o Pi sozinho não teria como calcular, porque dependem do que
-   o servidor viu chegar, não do que ele recebeu de volta.
-7. Se a rodada também mede vazão (o que não acontece em toda rodada), Pi e
-   servidor trocam um bloco de bytes de subida e outro de descida pelo mesmo
+5. Depois do último pacote (e de uma pequena espera pelos retardatários), o Raspberry Pi encerra o socket UDP e avisa o fim da rodada pelo canal de controle.
+6. Só então o servidor calcula e devolve as métricas do lado dele: quantos pacotes recebeu, jitter e atraso de ida vistos por ele, entre outras. São
+   números que o Raspberry Pi não teria como calcular por si próprio, porque dependem do que o servidor viu chegar, não do que ele recebeu de volta.
+7. Se a rodada também mede vazão (o que não acontece em toda rodada), o Raspberry Pi e servidor trocam um bloco de bytes de subida e outro de descida pelo mesmo
    canal de controle, e só depois encerram a sessão.
 
 Separar T1 a T4 dessa forma é o que permite calcular RTT usando só o relógio
-do Pi (imune a qualquer diferença entre os dois relógios) e, à parte, o
+do Raspberry Pi (imune a qualquer diferença entre os dois relógios) e, à parte, o
 atraso de ida e de volta isoladamente, que já depende dos dois relógios
 estarem sincronizados (ver seção 2 mais abaixo).
 
@@ -71,7 +58,7 @@ Não há nada para instalar: tudo roda com a biblioteca padrão do Python 3.
 
 ## 1. Preparar o servidor do laboratório
 
-Antes de mais nada, confira o básico: IP do servidor, rota até o Pi, e se o
+Antes de mais nada, confira o básico: IP do servidor, rota até o Raspberry Pi, e se o
 Python instalado é 3.10+ (o código usa `from __future__ import annotations`
 e tipos como `str | None`).
 
@@ -99,7 +86,7 @@ python3 reflector_server.py --bind 0.0.0.0 --udp-port 5000 --tcp-port 5001
 python3 telemetry_server.py --bind 0.0.0.0 --port 8080 --db telemetria.db
 ```
 
-### Teste rápido no Pi, antes do setup completo
+### Teste rápido no raspberry, antes do setup completo
 
 Vale confirmar que o caminho básico funciona antes de mexer em relógio ou
 roteamento por política (próximas duas seções). Com uma única interface já
@@ -146,13 +133,12 @@ O agente já estima o offset residual (`offset_relogios_ms`, filtrado pela amost
 menor RTT) e corrige os valores de ida/volta. Se `chronyc` mostrar offset maior que
 uns 20% do seu RTT típico, trate ida/volta como qualitativos e decida pelo RTT.
 
-## 3. Roteamento por política no Raspberry Pi: a parte crítica
+## 3. Roteamento por política no Raspberry Pi:
 
 Com três interfaces ativas ao mesmo tempo, `bind()` no IP **não** faz o pacote sair
 pela interface certa: a tabela de rotas usa a rota default para tudo. E as respostas
 que chegam por uma interface "errada" são descartadas pelo filtro de caminho reverso.
-O código usa `SO_BINDTODEVICE` (por isso precisa de root), mas você ainda precisa de
-uma tabela de rotas por interface:
+O código usa `SO_BINDTODEVICE` (por isso precisa de root), mas ainda é necessário uma tabela de rotas por interface:
 
 ```bash
 # /etc/iproute2/rt_tables: dê um nome a cada tabela
@@ -271,22 +257,6 @@ WantedBy=multi-user.target
 
 No servidor, o mesmo padrão com `ExecStart=/usr/bin/python3 /opt/aquaviario/reflector_server.py`.
 
-## Metodologia: o que estraga o experimento
-
-1. **Testar as interfaces em paralelo.** Elas competem por CPU e, no Pi, pelo mesmo
-   barramento USB (em modelos anteriores ao Pi 4, a Ethernet é USB). Por isso o
-   agente é sequencial de propósito.
-2. **Testar em bloco**, todo o `eth0`, depois todo o `wlan0`. Isso mede a hora do
-   dia, não a interface. O rodízio entre rodadas já corrige isso, mas ainda vale
-   rodar por 24 h para pegar o horário de pico.
-3. **Ignorar a saturação de CPU.** Em Python, acima de ~2000 pps quem vira gargalo é
-   o Pi, não a rede. Cada rodada já grava `pi_sistema` (loadavg, memória,
-   temperatura da CPU) ao lado de `servidor_sistema`/`proc_servidor_us`: se o
-   processamento sobe junto com o RTT, o número é nosso, não do enlace.
-4. **Só olhar a média.** É preciso comparar também p95/p99 e o IQR. Para a maioria
-   das aplicações, um enlace de 30 ms estável vale mais que um de 12 ms que de vez
-   em quando dispara para 400 ms.
-
 ## Bancada de testes sem hardware (`testbed.sh`)
 
 Dá para validar todo o sistema sem o Raspberry. O `testbed.sh` monta, numa única máquina Linux, dois *network namespaces* ligados por três pares `veth`, cada um com seu próprio perfil de atraso e perda:
@@ -313,7 +283,7 @@ sudo ./testbed.sh down          # derruba refletor/telemetria e remove tudo
 ```
 
 O refletor e o servidor de telemetria sobem uma única vez, no `up`, e ficam no
-ar até o `down`, sobrevivem a quantos `run`/`decide` você rodar no meio
+ar até o `down`, sobrevivem a quantos `run`/`decide` forem rodados no meio
 (exatamente como o servidor do laboratório de verdade, que não reinicia a
 cada teste). O dashboard em `http://10.99.0.1:8080/` continua acessível
 mesmo depois que um `run` termina.
@@ -331,8 +301,8 @@ kernel, nesse caso usar uma VM Linux de verdade.
 - **Os dois lados compartilham o mesmo relógio**, então `owd_ida_ms` e
   `owd_volta_ms` podem ser conferidos contra o valor exato que você pôs no `netem`.
   É a única situação em que você tem a resposta certa na mão.
-- Exercita o mesmo `SO_BINDTODEVICE` + `ip rule`/`ip route` que o Pi vai precisar,
-  então serve para depurar o roteamento antes de encostar no Raspberry.
+- Exercita o mesmo `SO_BINDTODEVICE` + `ip rule`/`ip route` que o raspberry vai precisar,
+  então serve para depurar o roteamento antes de ir para o hardware real.
 
 ### O que a bancada NÃO reproduz
 
@@ -355,8 +325,8 @@ automaticamente quando um link piora.
   (decai com o tempo, uma falha agora pesa mais que uma de 5 rodadas
   atrás). A estabilidade multiplica em vez de somar de propósito: um link
   ruim porém constante não ganha pontos de graça por ser estável. Testável
-  isolado, sem Pi nem bancada nenhuma.
-- **`decision_engine.py`** roda no Pi ao lado do `agent_rpi.py`, reaproveita
+  isolado, sem raspberry nem bancada nenhuma.
+- **`decision_engine.py`** roda no Raspberry Pi ao lado do `agent_rpi.py`, reaproveita
   o mesmo `run_test()`. Cada ciclo sonda todas as interfaces, calcula o score
   de cada uma e, se o melhor link atual **não** é o ativo, só troca a rota
   default (`ip route replace default ... dev <iface>`) depois que o candidato
@@ -366,7 +336,7 @@ automaticamente quando um link piora.
   `decisao.jsonl`. Se `ip route replace` falhar, a engine registra
   `failover_falhou`/`ativacao_inicial_falhou` e continua tentando no ciclo
   seguinte, em vez de morrer.
-- A histerese vale para o caso "outro link parece um pouco melhor". Quando a
+- A histerese (atraso) vale para o caso "outro link parece um pouco melhor". Quando a
   interface **ativa** simplesmente cai (timeout, sem resposta) por
   `--fail-fast-rounds` ciclos seguidos, a engine troca na hora pro melhor
   link que ainda responde, sem esperar `--margin`/`--hysteresis-rounds`;
@@ -386,7 +356,7 @@ automaticamente quando um link piora.
   não faz esse bind, segue a rota default trocada pela engine. É assim que
   dá pra monitorar os links inativos sem tirá-los do ar.
 
-Testável 100% na bancada, sem Pi: `sudo ./testbed.sh decide` sobe a engine
+Dá pra testar na bancada, sem raspberry: `sudo ./testbed.sh decide` sobe a engine
 dentro do netns `rpi`; em outro terminal, `sudo ./testbed.sh flap wlan0 bad`
 degrada o `wlan0` na hora (300ms±100ms, 60% de perda) e dá pra ver a engine
 detectar e trocar pra `eth0` no log. `sudo ./testbed.sh flap wlan0 good`
@@ -400,7 +370,7 @@ sudo python3 decision_engine.py --server 10.99.0.1 \
     --log decisao.jsonl
 ```
 
-No Pi real, `--gateways` leva os gateways de verdade de cada interface
+No raspberry real, `--gateways` leva os gateways de verdade de cada interface
 (mesmos IPs usados na seção 3). Ao iniciar, a engine confere se cada
 interface acha rota pro servidor (`ip route get <server> from <ip> oif
 <iface>`) e se tem gateway configurado, avisando alto no `stderr` em vez
@@ -414,7 +384,7 @@ Ele sempre começa sem link ativo e escolhe o melhor da primeira rodada.
 
 ## Banco de telemetria e store-and-forward
 
-`telemetry_server.py` (laboratório) + `telemetry_client.py` (Pi) resolvem o
+`telemetry_server.py` (laboratório) + `telemetry_client.py` (raspberry pi) resolvem o
 que faltava depois da sondagem: hoje cada resultado só existe como arquivo
 local (`resultados.jsonl`/`decisao.jsonl`) na máquina que rodou o teste,
 nada centraliza isso. Esse par manda cada resultado pro laboratório, sem
@@ -435,7 +405,7 @@ perder dado quando a conexão cai no meio do caminho.
     a cada `--tcp-every` ciclos), o gráfico mostra a lacuna em vez de traçar
     uma linha enganosa ligando os dois lados. A página recarrega sozinha a
     cada 5s enquanto há dado novo chegando.
-  - `GET /saude` é o health check que o Pi usa antes de tentar esvaziar a fila.
+  - `GET /saude` é o health check que o raspberry usa antes de tentar esvaziar a fila.
 - **`telemetry_client.py`**, fila local em SQLite (`Fila`), usada pelo
   `agent_rpi.py` e pelo `decision_engine.py` via `--telemetry-url`. Cada
   resultado é **sempre** enfileirado antes de tentar enviar; se o POST falhar
@@ -453,13 +423,12 @@ sudo python3 agent_rpi.py --server 192.168.0.10 --ifaces eth0,wlan0,usb0 \
     --telemetry-db fila_telemetria.db
 ```
 
-Testável 100% na bancada: `sudo ./testbed.sh up` já sobe o `telemetry_server.py`
+Dá pra testar só na bancada: `sudo ./testbed.sh up` já sobe o `telemetry_server.py`
 (fica no ar até o `down`), e `run`/`decide` passam `--telemetry-url` sozinhos
 apontando pra ele. O `testbed.sh` também cria um link só de administração (`mgmt0` no
 seu Linux real ↔ `to-mgmt` no netns `lab`), então o dashboard em
-**`http://10.99.0.1:8080/`** abre direto no seu navegador de verdade, com os
-gráficos e o auto-refresh de 5s funcionando de verdade (nada de HTML cru no
-terminal). Esse link não participa da sondagem, é só pra você ver a página;
+**`http://10.99.0.1:8080/`** abre direto no navegador, com os
+gráficos e o auto-refresh de 5s funcionando. Esse link não participa da sondagem, é só pra ver a página;
 `sudo ./testbed.sh telemetria status` continua útil se quiser o JSON sem
 navegador.
 
