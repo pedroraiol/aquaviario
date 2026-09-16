@@ -116,12 +116,21 @@ def _cores_por_iface(ifaces: list[str]) -> dict[str, str]:
 
 def _serie_por_iface(linhas_cron: list[dict], campo: str) -> dict[str, list[tuple[int, float]]]:
     """linhas_cron: mais antiga primeiro. Agrupa por iface, pulando None (erro
-    na rodada ou métrica que só é medida de vez em quando, como vazão)."""
+    na rodada ou métrica que só é medida de vez em quando, como vazão).
+
+    Usa o número da rodada como eixo x (não a posição na lista): a rodada é
+    compartilhada entre interfaces no mesmo ciclo, então alinha os pontos de
+    ifaces diferentes que aconteceram juntos, E deixa `_grafico_svg` enxergar
+    rodadas puladas (ex.: vazão só medida a cada --tcp-every) como o que são
+    -- uma lacuna real, não intervalo entre pontos de outro iface intercalado."""
     out: dict[str, list[tuple[int, float]]] = defaultdict(list)
-    for i, r in enumerate(linhas_cron):
+    for r in linhas_cron:
         v = r.get(campo)
-        if v is not None:
-            out[r["iface"]].append((i, v))
+        rodada = r.get("rodada")
+        if v is not None and rodada is not None:
+            out[r["iface"]].append((rodada, v))
+    for pts in out.values():
+        pts.sort(key=lambda p: p[0])
     return dict(out)
 
 
@@ -129,8 +138,22 @@ def _num(v: float) -> str:
     return f"{v:.3g}"
 
 
+def _segmentos_continuos(pts: list[tuple[int, float]]) -> list[list[tuple[int, float]]]:
+    """Quebra em blocos onde a rodada avança de 1 em 1; um salto >1 (vazão não
+    medida nessa rodada, ou erro) vira um corte visível em vez de reta ligando
+    os dois lados da lacuna."""
+    if not pts:
+        return []
+    blocos = [[pts[0]]]
+    for atual, prox in zip(pts, pts[1:]):
+        if prox[0] - atual[0] > 1:
+            blocos.append([])
+        blocos[-1].append(prox)
+    return blocos
+
+
 def _grafico_svg(titulo: str, unidade: str, series: dict[str, list[tuple[int, float]]],
-                  slot_por_iface: dict[str, int], largura: int = 640, altura: int = 160) -> str:
+                  slot_por_iface: dict[str, int], largura: int = 760, altura: int = 240) -> str:
     """Gráfico de linha, um eixo só, cor fixa por iface (nunca por rank).
     Sem JS: o hover funciona via <title> nativo do SVG em cada ponto."""
     if not series:
@@ -138,7 +161,7 @@ def _grafico_svg(titulo: str, unidade: str, series: dict[str, list[tuple[int, fl
                 f'<span class="unidade">({html.escape(unidade)})</span></h3>'
                 f'<p class="sem-dado">sem dados ainda</p></div>')
 
-    pad_l, pad_r, pad_t, pad_b = 40, 12, 10, 10
+    pad_l, pad_r, pad_t, pad_b = 44, 16, 12, 12
     plot_w, plot_h = largura - pad_l - pad_r, altura - pad_t - pad_b
 
     todos_x = [x for pts in series.values() for x, _ in pts]
@@ -168,18 +191,26 @@ def _grafico_svg(titulo: str, unidade: str, series: dict[str, list[tuple[int, fl
 
     for iface, pts in sorted(series.items()):
         cor = f"var(--series-{slot_por_iface[iface] % 8 + 1})"
-        d = " ".join(f'{"M" if i == 0 else "L"}{sx(x):.1f},{sy(y):.1f}' for i, (x, y) in enumerate(pts))
-        partes.append(f'<path d="{d}" class="linha" stroke="{cor}"/>')
+        for bloco in _segmentos_continuos(pts):
+            if len(bloco) == 1:
+                # ponto isolado (sem vizinho na mesma rodada+1 pra conectar):
+                # um "M" sozinho não desenha nada em SVG, então marca com um
+                # ponto sólido pra não sumir da vista.
+                x, y = bloco[0]
+                partes.append(f'<circle cx="{sx(x):.1f}" cy="{sy(y):.1f}" r="3.5" fill="{cor}"/>')
+                continue
+            d = " ".join(f'{"M" if i == 0 else "L"}{sx(x):.1f},{sy(y):.1f}' for i, (x, y) in enumerate(bloco))
+            partes.append(f'<path d="{d}" class="linha" stroke="{cor}"/>')
         for x, y in pts:
             partes.append(
-                f'<circle cx="{sx(x):.1f}" cy="{sy(y):.1f}" r="8" class="alvo-hover">'
-                f'<title>{html.escape(iface)}: {_num(y)} {html.escape(unidade)}</title></circle>'
+                f'<circle cx="{sx(x):.1f}" cy="{sy(y):.1f}" r="9" class="alvo-hover">'
+                f'<title>{html.escape(iface)}: {_num(y)} {html.escape(unidade)} (rodada {x})</title></circle>'
             )
         ux, uy = pts[-1]
         partes.append(
-            f'<circle cx="{sx(ux):.1f}" cy="{sy(uy):.1f}" r="6" class="anel-fim"/>'
-            f'<circle cx="{sx(ux):.1f}" cy="{sy(uy):.1f}" r="4" fill="{cor}"/>'
-            f'<text x="{sx(ux) + 8:.1f}" y="{sy(uy) + 3:.1f}" class="rotulo-fim">{_num(uy)}</text>'
+            f'<circle cx="{sx(ux):.1f}" cy="{sy(uy):.1f}" r="7" class="anel-fim"/>'
+            f'<circle cx="{sx(ux):.1f}" cy="{sy(uy):.1f}" r="5" fill="{cor}"/>'
+            f'<text x="{sx(ux) + 9:.1f}" y="{sy(uy) + 4:.1f}" class="rotulo-fim">{_num(uy)}</text>'
         )
 
     legenda = ""
@@ -267,14 +298,14 @@ h1, h3 {{ color: var(--texto); }}
 
 .grade-graficos {{ display: flex; flex-wrap: wrap; gap: 1.5rem; margin-bottom: 2rem; }}
 .grafico {{ background: var(--superficie); border: 1px solid var(--grade); border-radius: 6px;
-            padding: 0.75rem 1rem; flex: 1 1 340px; }}
-.grafico h3 {{ margin: 0 0 0.4rem; font-size: 0.95rem; }}
+            padding: 1rem 1.25rem; flex: 1 1 560px; max-width: 720px; }}
+.grafico h3 {{ margin: 0 0 0.5rem; font-size: 1.1rem; }}
 .grafico .unidade {{ color: var(--texto-mudo); font-weight: normal; }}
 .grafico .sem-dado {{ color: var(--texto-mudo); font-size: 0.85rem; }}
 .svg-grafico {{ width: 100%; height: auto; overflow: visible; }}
 .linha {{ fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }}
 .grade {{ stroke: var(--grade); stroke-width: 1; }}
-.rotulo-eixo, .rotulo-fim {{ fill: var(--texto-mudo); font-size: 9px; font-family: sans-serif; }}
+.rotulo-eixo, .rotulo-fim {{ fill: var(--texto-mudo); font-size: 11px; font-family: sans-serif; }}
 .anel-fim {{ fill: var(--superficie); }}
 .alvo-hover {{ fill: transparent; }}
 .alvo-hover:hover {{ fill: var(--texto-mudo); opacity: 0.3; }}
