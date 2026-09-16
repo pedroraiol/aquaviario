@@ -56,25 +56,32 @@ def init_db(path: str) -> None:
         )
     """)
     con.execute("CREATE INDEX IF NOT EXISTS idx_iface_tempo ON telemetria(iface, id)")
+    # migração: banco criado antes da coluna existir. IF NOT EXISTS em ADD
+    # COLUMN só existe em SQLite recente o bastante, então confere na mão.
+    colunas = {r[1] for r in con.execute("PRAGMA table_info(telemetria)")}
+    if "iface_ativa" not in colunas:
+        con.execute("ALTER TABLE telemetria ADD COLUMN iface_ativa INTEGER")
     con.commit()
     con.close()
 
 
 def inserir(db_path: str, registro: dict) -> None:
     u = registro.get("udp", {}) or {}
+    iface_ativa = registro.get("iface_ativa")  # só existe vindo do decision_engine.py
     with DB_LOCK, closing(sqlite3.connect(db_path)) as con, con:
         con.execute(
             """INSERT INTO telemetria
                (host, iface, rodada, rtt_p50_ms, jitter_ms,
                 perda_ida_pct, perda_volta_pct, perda_total_pct,
-                tcp_up_mbps, tcp_down_mbps, erro, payload)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                tcp_up_mbps, tcp_down_mbps, iface_ativa, erro, payload)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 registro.get("host"), registro.get("iface"), registro.get("rodada"),
                 (u.get("rtt_ms") or {}).get("p50"), u.get("jitter_rtt_ms"),
                 u.get("perda_ida_pct"), u.get("perda_volta_pct"), u.get("perda_total_pct"),
                 (registro.get("tcp_subida") or {}).get("mbps_servidor"),
                 (registro.get("tcp_descida") or {}).get("mbps_agente"),
+                None if iface_ativa is None else int(iface_ativa),
                 registro.get("erro"),
                 json.dumps(registro, ensure_ascii=False),
             ),
@@ -108,6 +115,20 @@ def idade_ultimo_registro_s(db_path: str) -> float | None:
     return (datetime.now(timezone.utc) - ts).total_seconds()
 
 
+def interface_ativa(db_path: str) -> dict | None:
+    """A interface marcada como ativa no registro mais recente que veio com
+    essa informação (só o decision_engine.py manda `iface_ativa`; rodando o
+    agent_rpi.py sozinho, sem failover, não existe "ativa" e isso fica None).
+    """
+    with closing(sqlite3.connect(db_path)) as con:
+        con.row_factory = sqlite3.Row
+        row = con.execute(
+            "SELECT iface, host, recebido_em FROM telemetria "
+            "WHERE iface_ativa = 1 ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    return dict(row) if row else None
+
+
 def _cores_por_iface(ifaces: list[str]) -> dict[str, str]:
     """ordem fixa (alfabética), não por score/rank: um iface não pode trocar
     de cor entre uma atualização e outra só porque outro ficou melhor."""
@@ -139,14 +160,22 @@ def _num(v: float) -> str:
 
 
 def _segmentos_continuos(pts: list[tuple[int, float]]) -> list[list[tuple[int, float]]]:
-    """Quebra em blocos onde a rodada avança de 1 em 1; um salto >1 (vazão não
-    medida nessa rodada, ou erro) vira um corte visível em vez de reta ligando
-    os dois lados da lacuna."""
+    """Quebra em blocos só onde o salto de rodada foge do cadenciamento normal
+    dessa série. Uma métrica como vazão não é medida toda rodada por natureza
+    (--tcp-every), então o espaçamento "normal" dela pode ser 3, 5 rodadas...
+    o corte é pra pulo INESPERADO (bem maior que esse passo normal, ex.: uma
+    medição agendada que não rolou por link degradado, ou erro), não pra
+    distância que já é regra do jeito que a métrica é coletada."""
     if not pts:
         return []
+    if len(pts) == 1:
+        return [pts]
+    passos = [b[0] - a[0] for a, b in zip(pts, pts[1:])]
+    passo_normal = min(passos)
+    limite = passo_normal * 1.5
     blocos = [[pts[0]]]
-    for atual, prox in zip(pts, pts[1:]):
-        if prox[0] - atual[0] > 1:
+    for prox, passo in zip(pts[1:], passos):
+        if passo > limite:
             blocos.append([])
         blocos[-1].append(prox)
     return blocos
@@ -234,10 +263,29 @@ def _grafico_svg(titulo: str, unidade: str, series: dict[str, list[tuple[int, fl
 def dashboard_html(db_path: str) -> str:
     linhas = ultimos(db_path, 50, None)
     idade = idade_ultimo_registro_s(db_path)
-    ativo = idade is not None and idade < ATIVO_JANELA_S
+    recebendo_dados = idade is not None and idade < ATIVO_JANELA_S
+    iface_ativa_info = interface_ativa(db_path)
 
     linhas_cron = list(reversed(linhas))          # mais antiga primeiro, pros gráficos
     slot_por_iface = _cores_por_iface({r["iface"] for r in linhas_cron if r.get("iface")})
+
+    if iface_ativa_info:
+        slot = slot_por_iface.get(iface_ativa_info["iface"])
+        cor = f"var(--series-{slot % 8 + 1})" if slot is not None else "var(--texto)"
+        banner_ativa = (
+            '<div class="banner-ativa">interface em uso agora: '
+            f'<strong style="color:{cor}">{html.escape(iface_ativa_info["iface"])}</strong>'
+            f' <span class="banner-ativa-detalhe">(host {html.escape(iface_ativa_info["host"] or "?")}, '
+            f'desde {html.escape(iface_ativa_info["recebido_em"])})</span></div>'
+        )
+    else:
+        banner_ativa = (
+            '<div class="banner-ativa banner-ativa-vazio">nenhuma interface ativa '
+            'registrada ainda. Isso só aparece quando quem está mandando telemetria é '
+            'o decision_engine.py (com --telemetry-url); rodando o agent_rpi.py sozinho '
+            'não existe failover, então não existe "ativa".</div>'
+        )
+
     graficos = "".join(
         _grafico_svg(titulo, unidade, _serie_por_iface(linhas_cron, campo), slot_por_iface)
         for titulo, unidade, campo in [
@@ -254,20 +302,22 @@ def dashboard_html(db_path: str) -> str:
 
     trs = "\n".join(
         f"<tr><td>{cel(r['recebido_em'])}</td><td>{cel(r['host'])}</td>"
-        f"<td>{cel(r['iface'])}</td><td>{cel(r['rodada'])}</td>"
+        f"<td>{cel(r['iface'])}</td>"
+        f"<td class=\"marca-ativa\">{'X' if r.get('iface_ativa') == 1 else ''}</td>"
+        f"<td>{cel(r['rodada'])}</td>"
         f"<td>{cel(r['rtt_p50_ms'])}</td><td>{cel(r['jitter_ms'])}</td>"
         f"<td>{cel(r['perda_ida_pct'])}</td><td>{cel(r['perda_volta_pct'])}</td>"
         f"<td>{cel(r['tcp_up_mbps'])}</td><td>{cel(r['tcp_down_mbps'])}</td>"
         f"<td style=\"color:#b00\">{cel(r['erro'])}</td></tr>"
         for r in linhas
     )
-    refresh_tag = '<meta http-equiv="refresh" content="5">' if ativo else ""
-    if ativo:
-        status = "🟢 recebendo dados ao vivo, atualiza sozinho a cada 5s"
+    refresh_tag = '<meta http-equiv="refresh" content="5">' if recebendo_dados else ""
+    if recebendo_dados:
+        status = " Recebendo dados ao vivo, atualiza sozinho a cada 5s"
     elif idade is None:
-        status = "⏸ parado, nenhum registro ainda"
+        status = "⏸ Parado, nenhum registro ainda"
     else:
-        status = f"⏸ parado, sem registro novo há {int(idade)}s"
+        status = f"⏸ Parado, sem registro novo há {int(idade)}s"
     return f"""<!doctype html>
 <html><head><meta charset="utf-8">{refresh_tag}
 <title>aquaviario: telemetria</title>
@@ -313,16 +363,23 @@ h1, h3 {{ color: var(--texto); }}
             font-family: sans-serif; margin-bottom: 0.3rem; }}
 .legenda-item {{ display: inline-flex; align-items: center; gap: 0.3rem; }}
 .legenda-cor {{ width: 10px; height: 10px; border-radius: 2px; display: inline-block; }}
+.banner-ativa {{ background: var(--superficie); border: 1px solid var(--grade);
+                 border-radius: 6px; padding: 0.6rem 1rem; margin-bottom: 1rem;
+                 font-size: 1rem; }}
+.banner-ativa-detalhe {{ color: var(--texto-mudo); font-size: 0.85rem; }}
+.banner-ativa-vazio {{ color: var(--texto-mudo); font-size: 0.85rem; }}
+.marca-ativa {{ text-align: center; }}
 </style></head>
 <body>
 <h1>aquaviario: últimos registros recebidos</h1>
+{banner_ativa}
 <p>{status}, {len(linhas)} registros mostrados (gráficos em ordem cronológica, tabela mais recente primeiro)
 <a href="/">atualizar</a></p>
 <div class="grade-graficos">
 {graficos}
 </div>
 <table>
-<tr><th>recebido</th><th>host</th><th>iface</th><th>rodada</th>
+<tr><th>recebido</th><th>host</th><th>iface</th><th>ativa</th><th>rodada</th>
 <th>rtt p50 ms</th><th>jitter ms</th><th>perda ida %</th><th>perda volta %</th>
 <th>tcp up mbps</th><th>tcp down mbps</th><th>erro</th></tr>
 {trs}
