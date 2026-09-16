@@ -256,6 +256,13 @@ def main():
                          "rodada": rodada, "iface": iface,
                          "erro": f"{type(e).__name__}: {e}"}
                     resumo_r = {"ok": False}
+                # marca no próprio registro qual era a interface ativa quando essa
+                # rodada foi sondada (a decisão desse ciclo só é tomada depois que
+                # todas as interfaces passam por aqui, então isso reflete o `ativo`
+                # herdado do ciclo anterior); é o que o telemetry_server.py usa pra
+                # mostrar "interface em uso agora" no dashboard, sem precisar
+                # reconstruir a lógica de failover a partir da telemetria bruta.
+                r["iface_ativa"] = ativo is not None and iface == ativo
                 if fila:
                     fila.enfileirar(r)
                     fila.esvaziar()
