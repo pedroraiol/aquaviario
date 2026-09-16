@@ -18,6 +18,39 @@ Raspberry Pi (agente)                          Servidor do laboratório (refleto
             T4 na chegada
 ```
 
+### Como funciona uma rodada de sondagem
+
+Toda rodada testa uma interface de cada vez, sempre na mesma sequência:
+
+1. O Pi abre uma conexão de controle TCP com o servidor (porta 5001) e avisa
+   que vai começar uma rodada de UDP. É nesse momento que o servidor passa a
+   contar as estatísticas daquela sessão.
+2. O Pi dispara os pacotes de teste por UDP, um de cada vez numa taxa fixa.
+   Cada pacote carrega o instante em que foi enviado (T1, medido no relógio
+   monotônico do Pi).
+3. O servidor recebe cada pacote e carimba o instante de chegada (T2); logo
+   antes de devolver a reflexão, carimba também o instante de envio da
+   resposta (T3).
+4. A resposta volta ao Pi com T1 (o mesmo que ele mandou), T2 e T3 dentro do
+   pacote. O Pi marca o instante de chegada dessa resposta (T4) e já calcula
+   o RTT daquele pacote na hora, como `(T4−T1) − (T3−T2)`: o tempo total de
+   ida e volta, descontando quanto o pacote ficou parado sendo processado
+   dentro do servidor.
+5. Depois do último pacote (e de uma pequena espera pelos retardatários), o
+   Pi encerra o socket UDP e avisa o fim da rodada pelo canal de controle.
+6. Só então o servidor calcula e devolve as métricas do lado dele: quantos
+   pacotes recebeu, jitter e atraso de ida vistos por ele, entre outras. São
+   números que o Pi sozinho não teria como calcular, porque dependem do que
+   o servidor viu chegar, não do que ele recebeu de volta.
+7. Se a rodada também mede vazão (o que não acontece em toda rodada), Pi e
+   servidor trocam um bloco de bytes de subida e outro de descida pelo mesmo
+   canal de controle, e só depois encerram a sessão.
+
+Separar T1 a T4 dessa forma é o que permite calcular RTT usando só o relógio
+do Pi (imune a qualquer diferença entre os dois relógios) e, à parte, o
+atraso de ida e de volta isoladamente, que já depende dos dois relógios
+estarem sincronizados (ver seção 2 mais abaixo).
+
 ## Arquivos
 
 | arquivo | onde roda | função |
@@ -29,7 +62,7 @@ Raspberry Pi (agente)                          Servidor do laboratório (refleto
 | `score.py` | Raspberry Pi | transforma o histórico de uma interface numa nota 0-100 |
 | `decision_engine.py` | Raspberry Pi | sonda continuamente, pontua e troca a rota default (failover) |
 | `telemetry_client.py` | Raspberry Pi | fila local (SQLite) + envio store-and-forward pro laboratório |
-| `telemetry_server.py` | servidor do lab | endpoint HTTP + banco (SQLite) + dashboard somente-leitura |
+| `telemetry_server.py` | servidor do lab | endpoint HTTP + banco (SQLite) + dashboard com gráficos |
 | `testbed.sh` | qualquer uma | bancada sem hardware, namespaces simulando as 3 interfaces |
 
 Não há nada para instalar: tudo roda com a biblioteca padrão do Python 3.
@@ -38,11 +71,64 @@ Não há nada para instalar: tudo roda com a biblioteca padrão do Python 3.
 
 ## 1. Preparar o servidor do laboratório
 
+Antes de mais nada, confira o básico: IP do servidor, rota até o Pi, e se o
+Python instalado é 3.10+ (o código usa `from __future__ import annotations`
+e tipos como `str | None`).
+
+```bash
+ip -br addr
+ip route
+python3 --version
+ls
+python3 -m py_compile reflector_server.py protocol.py telemetry_server.py
+```
+
+Libere as portas e suba o refletor (mede o enlace) e o servidor de
+telemetria (guarda o que foi medido e mostra o dashboard, são coisas
+diferentes, ver seção sobre telemetria mais abaixo):
+
 ```bash
 sudo ufw allow 5000/udp
 sudo ufw allow 5001/tcp
-python3 reflector_server.py --bind 0.0.0.0
+sudo ufw allow 8080/tcp
+sudo ufw status
+
+python3 reflector_server.py --bind 0.0.0.0 --udp-port 5000 --tcp-port 5001
+
+# outro terminal
+python3 telemetry_server.py --bind 0.0.0.0 --port 8080 --db telemetria.db
 ```
+
+### Teste rápido no Pi, antes do setup completo
+
+Vale confirmar que o caminho básico funciona antes de mexer em relógio ou
+roteamento por política (próximas duas seções). Com uma única interface já
+dá pra validar ponta a ponta:
+
+```bash
+ip -br addr
+ip route
+iw dev wlan0 link
+
+ping -I wlan0 -c 10 IP_SERVIDOR
+curl http://IP_SERVIDOR:8080/saude
+nc -vz IP_SERVIDOR 5001
+
+sudo python3 agent_rpi.py \
+    --server IP_SERVIDOR \
+    --ifaces wlan0 \
+    --rounds 3 \
+    --count 100 \
+    --pps 10 \
+    --tcp-bytes 0 \
+    --out primeiro_teste.jsonl
+
+python3 analisar.py primeiro_teste.jsonl
+```
+
+Se isso funcionar, o próximo passo é sincronizar os relógios e, quando
+houver mais de uma interface, configurar o roteamento por política das
+próximas duas seções antes de partir para o teste completo (seção 4).
 
 ## 2. Sincronizar os relógios (obrigatório para atraso de ida e volta separados)
 
@@ -340,7 +426,15 @@ perder dado quando a conexão cai no meio do caminho.
   - `POST /telemetria` recebe um registro (mesmo JSON que o agente já grava
     localmente) e insere no banco.
   - `GET /telemetria?limit=&iface=` devolve os últimos registros em JSON.
-  - `GET /` é um dashboard HTML somente-leitura, recarrega sozinho a cada 5s.
+  - `GET /` é o dashboard: gráficos de RTT, jitter, perda e vazão por
+    interface, cada uma com sua cor fixa e o valor de cada ponto disponível
+    ao passar o mouse, além da tabela detalhada com os números exatos. Os
+    gráficos são SVG gerado em Python, sem nenhuma biblioteca externa nem
+    JavaScript, então funcionam mesmo sem internet no laboratório. Quando
+    uma métrica não foi medida naquela rodada (a vazão, por exemplo, só roda
+    a cada `--tcp-every` ciclos), o gráfico mostra a lacuna em vez de traçar
+    uma linha enganosa ligando os dois lados. A página recarrega sozinha a
+    cada 5s enquanto há dado novo chegando.
   - `GET /saude` é o health check que o Pi usa antes de tentar esvaziar a fila.
 - **`telemetry_client.py`**, fila local em SQLite (`Fila`), usada pelo
   `agent_rpi.py` e pelo `decision_engine.py` via `--telemetry-url`. Cada
@@ -363,10 +457,11 @@ Testável 100% na bancada: `sudo ./testbed.sh up` já sobe o `telemetry_server.p
 (fica no ar até o `down`), e `run`/`decide` passam `--telemetry-url` sozinhos
 apontando pra ele. O `testbed.sh` também cria um link só de administração (`mgmt0` no
 seu Linux real ↔ `to-mgmt` no netns `lab`), então o dashboard em
-**`http://10.99.0.1:8080/`** abre direto no seu navegador de verdade, com o
-auto-refresh de 5s funcionando (nada de HTML cru no terminal). Esse link
-não participa da sondagem, é só pra você ver a página; `sudo ./testbed.sh
-telemetria status` continua útil se quiser o JSON sem navegador.
+**`http://10.99.0.1:8080/`** abre direto no seu navegador de verdade, com os
+gráficos e o auto-refresh de 5s funcionando de verdade (nada de HTML cru no
+terminal). Esse link não participa da sondagem, é só pra você ver a página;
+`sudo ./testbed.sh telemetria status` continua útil se quiser o JSON sem
+navegador.
 
 Pra ver o store-and-forward de verdade: derrube a interface ativa com
 `flap <iface> down` durante um `decide`, espere alguns ciclos (a fila local
@@ -374,8 +469,8 @@ acumula, sem travar o resto do sistema) e religue com `flap <iface> up`.
 Os registros atrasados aparecem no banco e no dashboard na sequência certa.
 
 Ainda não implementado: um dashboard que combine telemetria de vários Pis
-(hoje é uma tabela simples por servidor) e HTTPS/autenticação no endpoint.
-O slide 8 pede domínio institucional e HTTPS, que fazem sentido quando o
-servidor estiver exposto além do laboratório.
+(hoje os gráficos e a tabela mostram um único servidor) e HTTPS/autenticação
+no endpoint. O slide 8 pede domínio institucional e HTTPS, que fazem sentido
+quando o servidor estiver exposto além do laboratório.
 
 
