@@ -228,7 +228,7 @@ python3 analisar.py resultados.jsonl --csv resumo.csv --por-teste-csv bruto.csv
 | `proc_servidor_us` | `T3−T2`, o custo interno do refletor, já descontado do RTT |
 | `estab_rtt_iqr_ms` | dispersão do RTT entre rodadas: mede **previsibilidade**, não velocidade |
 
-A separação ida/volta é o que essa arquitetura te dá de mais valioso: um enlace 4G com
+A separação ida/volta é o que essa arquitetura tem de mais valioso: um enlace 4G com
 5% de perda só na subida e um Wi-Fi com 5% distribuído são problemas completamente
 diferentes, e um teste de RTT puro mostraria os dois como "5%".
 
