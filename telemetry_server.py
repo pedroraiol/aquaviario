@@ -23,6 +23,7 @@ import html
 import json
 import sqlite3
 import threading
+from collections import defaultdict
 from contextlib import closing
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -30,6 +31,14 @@ from urllib.parse import parse_qs, urlparse
 
 DB_LOCK = threading.Lock()
 ATIVO_JANELA_S = 10  # sem registro novo nesse intervalo, considera "parado"
+
+# paleta categórica (claro, escuro) por slot; ordem fixa por interface
+# (ordenada alfabeticamente), nunca ciclada por rank/score.
+PALETA_SERIES = [
+    ("#2a78d6", "#3987e5"), ("#eb6834", "#d95926"), ("#1baf7a", "#199e70"),
+    ("#eda100", "#c98500"), ("#e87ba4", "#d55181"), ("#008300", "#008300"),
+    ("#4a3aa7", "#9085e9"), ("#e34948", "#e66767"),
+]
 
 
 def init_db(path: str) -> None:
@@ -99,10 +108,115 @@ def idade_ultimo_registro_s(db_path: str) -> float | None:
     return (datetime.now(timezone.utc) - ts).total_seconds()
 
 
+def _cores_por_iface(ifaces: list[str]) -> dict[str, str]:
+    """ordem fixa (alfabética), não por score/rank: um iface não pode trocar
+    de cor entre uma atualização e outra só porque outro ficou melhor."""
+    return {iface: i for i, iface in enumerate(sorted(ifaces))}
+
+
+def _serie_por_iface(linhas_cron: list[dict], campo: str) -> dict[str, list[tuple[int, float]]]:
+    """linhas_cron: mais antiga primeiro. Agrupa por iface, pulando None (erro
+    na rodada ou métrica que só é medida de vez em quando, como vazão)."""
+    out: dict[str, list[tuple[int, float]]] = defaultdict(list)
+    for i, r in enumerate(linhas_cron):
+        v = r.get(campo)
+        if v is not None:
+            out[r["iface"]].append((i, v))
+    return dict(out)
+
+
+def _num(v: float) -> str:
+    return f"{v:.3g}"
+
+
+def _grafico_svg(titulo: str, unidade: str, series: dict[str, list[tuple[int, float]]],
+                  slot_por_iface: dict[str, int], largura: int = 640, altura: int = 160) -> str:
+    """Gráfico de linha, um eixo só, cor fixa por iface (nunca por rank).
+    Sem JS: o hover funciona via <title> nativo do SVG em cada ponto."""
+    if not series:
+        return (f'<div class="grafico"><h3>{html.escape(titulo)} '
+                f'<span class="unidade">({html.escape(unidade)})</span></h3>'
+                f'<p class="sem-dado">sem dados ainda</p></div>')
+
+    pad_l, pad_r, pad_t, pad_b = 40, 12, 10, 10
+    plot_w, plot_h = largura - pad_l - pad_r, altura - pad_t - pad_b
+
+    todos_x = [x for pts in series.values() for x, _ in pts]
+    todos_y = [y for pts in series.values() for _, y in pts]
+    xmin, xmax = min(todos_x), max(todos_x)
+    ymin, ymax = min(todos_y), max(todos_y)
+    if ymin == ymax:
+        ymin, ymax = ymin - 1, ymax + 1
+    folga = (ymax - ymin) * 0.1
+    ymin, ymax = ymin - folga, ymax + folga
+    xspan = max(1, xmax - xmin)
+
+    def sx(x):
+        return pad_l + (x - xmin) / xspan * plot_w
+
+    def sy(y):
+        return pad_t + plot_h - (y - ymin) / (ymax - ymin) * plot_h
+
+    partes = []
+    for k in range(5):
+        val = ymin + (ymax - ymin) * k / 4
+        y = sy(val)
+        partes.append(
+            f'<line x1="{pad_l}" y1="{y:.1f}" x2="{largura - pad_r}" y2="{y:.1f}" class="grade"/>'
+            f'<text x="{pad_l - 6}" y="{y + 3:.1f}" class="rotulo-eixo" text-anchor="end">{_num(val)}</text>'
+        )
+
+    for iface, pts in sorted(series.items()):
+        cor = f"var(--series-{slot_por_iface[iface] % 8 + 1})"
+        d = " ".join(f'{"M" if i == 0 else "L"}{sx(x):.1f},{sy(y):.1f}' for i, (x, y) in enumerate(pts))
+        partes.append(f'<path d="{d}" class="linha" stroke="{cor}"/>')
+        for x, y in pts:
+            partes.append(
+                f'<circle cx="{sx(x):.1f}" cy="{sy(y):.1f}" r="8" class="alvo-hover">'
+                f'<title>{html.escape(iface)}: {_num(y)} {html.escape(unidade)}</title></circle>'
+            )
+        ux, uy = pts[-1]
+        partes.append(
+            f'<circle cx="{sx(ux):.1f}" cy="{sy(uy):.1f}" r="6" class="anel-fim"/>'
+            f'<circle cx="{sx(ux):.1f}" cy="{sy(uy):.1f}" r="4" fill="{cor}"/>'
+            f'<text x="{sx(ux) + 8:.1f}" y="{sy(uy) + 3:.1f}" class="rotulo-fim">{_num(uy)}</text>'
+        )
+
+    legenda = ""
+    if len(series) > 1:
+        itens = "".join(
+            f'<span class="legenda-item"><span class="legenda-cor" '
+            f'style="background:var(--series-{slot_por_iface[iface] % 8 + 1})"></span>{html.escape(iface)}</span>'
+            for iface in sorted(series)
+        )
+        legenda = f'<div class="legenda">{itens}</div>'
+
+    return f"""<div class="grafico">
+<h3>{html.escape(titulo)} <span class="unidade">({html.escape(unidade)})</span></h3>
+{legenda}
+<svg viewBox="0 0 {largura} {altura}" class="svg-grafico" role="img" aria-label="{html.escape(titulo)} por rodada">
+{"".join(partes)}
+</svg>
+</div>"""
+
+
 def dashboard_html(db_path: str) -> str:
     linhas = ultimos(db_path, 50, None)
     idade = idade_ultimo_registro_s(db_path)
     ativo = idade is not None and idade < ATIVO_JANELA_S
+
+    linhas_cron = list(reversed(linhas))          # mais antiga primeiro, pros gráficos
+    slot_por_iface = _cores_por_iface({r["iface"] for r in linhas_cron if r.get("iface")})
+    graficos = "".join(
+        _grafico_svg(titulo, unidade, _serie_por_iface(linhas_cron, campo), slot_por_iface)
+        for titulo, unidade, campo in [
+            ("RTT p50", "ms", "rtt_p50_ms"),
+            ("Jitter", "ms", "jitter_ms"),
+            ("Perda total", "%", "perda_total_pct"),
+            ("Vazão subida", "Mbps", "tcp_up_mbps"),
+            ("Vazão descida", "Mbps", "tcp_down_mbps"),
+        ]
+    )
 
     def cel(v):
         return "" if v is None else html.escape(str(v))
@@ -127,15 +241,55 @@ def dashboard_html(db_path: str) -> str:
 <html><head><meta charset="utf-8">{refresh_tag}
 <title>aquaviario: telemetria</title>
 <style>
-body {{ font-family: monospace; margin: 2rem; }}
+:root {{
+  color-scheme: light;
+  --pagina: #f9f9f7; --superficie: #fcfcfb;
+  --texto: #0b0b0b; --texto-2: #52514e; --texto-mudo: #898781;
+  --grade: #e1e0d9; --eixo: #c3c2b7;
+  --series-1: #2a78d6; --series-2: #eb6834; --series-3: #1baf7a; --series-4: #eda100;
+  --series-5: #e87ba4; --series-6: #008300; --series-7: #4a3aa7; --series-8: #e34948;
+}}
+@media (prefers-color-scheme: dark) {{
+  :root {{
+    color-scheme: dark;
+    --pagina: #0d0d0d; --superficie: #1a1a19;
+    --texto: #ffffff; --texto-2: #c3c2b7; --texto-mudo: #898781;
+    --grade: #2c2c2a; --eixo: #383835;
+    --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70; --series-4: #c98500;
+    --series-5: #d55181; --series-6: #008300; --series-7: #9085e9; --series-8: #e66767;
+  }}
+}}
+body {{ font-family: monospace; margin: 2rem; background: var(--pagina); color: var(--texto); }}
 table {{ border-collapse: collapse; }}
-td, th {{ border: 1px solid #999; padding: 4px 8px; text-align: right; }}
-th {{ background: #eee; }}
+td, th {{ border: 1px solid var(--eixo); padding: 4px 8px; text-align: right; }}
+th {{ background: var(--superficie); }}
+h1, h3 {{ color: var(--texto); }}
+
+.grade-graficos {{ display: flex; flex-wrap: wrap; gap: 1.5rem; margin-bottom: 2rem; }}
+.grafico {{ background: var(--superficie); border: 1px solid var(--grade); border-radius: 6px;
+            padding: 0.75rem 1rem; flex: 1 1 340px; }}
+.grafico h3 {{ margin: 0 0 0.4rem; font-size: 0.95rem; }}
+.grafico .unidade {{ color: var(--texto-mudo); font-weight: normal; }}
+.grafico .sem-dado {{ color: var(--texto-mudo); font-size: 0.85rem; }}
+.svg-grafico {{ width: 100%; height: auto; overflow: visible; }}
+.linha {{ fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }}
+.grade {{ stroke: var(--grade); stroke-width: 1; }}
+.rotulo-eixo, .rotulo-fim {{ fill: var(--texto-mudo); font-size: 9px; font-family: sans-serif; }}
+.anel-fim {{ fill: var(--superficie); }}
+.alvo-hover {{ fill: transparent; }}
+.alvo-hover:hover {{ fill: var(--texto-mudo); opacity: 0.3; }}
+.legenda {{ display: flex; flex-wrap: wrap; gap: 0.6rem; font-size: 0.8rem; color: var(--texto-2);
+            font-family: sans-serif; margin-bottom: 0.3rem; }}
+.legenda-item {{ display: inline-flex; align-items: center; gap: 0.3rem; }}
+.legenda-cor {{ width: 10px; height: 10px; border-radius: 2px; display: inline-block; }}
 </style></head>
 <body>
 <h1>aquaviario: últimos registros recebidos</h1>
-<p>{status}, {len(linhas)} registros mostrados (mais recente primeiro)
+<p>{status}, {len(linhas)} registros mostrados (gráficos em ordem cronológica, tabela mais recente primeiro)
 <a href="/">atualizar</a></p>
+<div class="grade-graficos">
+{graficos}
+</div>
 <table>
 <tr><th>recebido</th><th>host</th><th>iface</th><th>rodada</th>
 <th>rtt p50 ms</th><th>jitter ms</th><th>perda ida %</th><th>perda volta %</th>
