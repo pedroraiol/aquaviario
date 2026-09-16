@@ -378,12 +378,4 @@ Ainda não implementado: um dashboard que combine telemetria de vários Pis
 O slide 8 pede domínio institucional e HTTPS, que fazem sentido quando o
 servidor estiver exposto além do laboratório.
 
-## Se precisar de mais precisão
 
-- **Timestamps de hardware:** `SO_TIMESTAMPING` com `SOF_TIMESTAMPING_RX_HARDWARE`
-  tira o jitter do escalonador da conta. Cheque suporte com `ethtool -T eth0`.
-  A NIC do Pi não faz timestamp em hardware; a do servidor talvez sim.
-- **Validação cruzada:** rode `irtt` (mede exatamente isso, em Go, com muito menos
-  overhead) e `iperf3 -B <ip> --bind-dev eth0` uma vez em cada interface e confira se
-  a ordem das interfaces bate com a sua. Se divergir muito, o gargalo é o agente.
-- **Reescrever a fase UDP em C** só vale a pena acima de ~5000 pps.
