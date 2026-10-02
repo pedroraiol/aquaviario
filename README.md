@@ -39,6 +39,7 @@ atraso de ida e de volta isoladamente, que já depende dos dois relógios
 estarem sincronizados (ver seção 2 mais abaixo).
 
 ## Arquivos
+CALCULAR PROBABILIDADE PRA CADA INTERRFACE (VER QUAL TEM MAIOR PROBABILIDADE!!!!!!) -> NAO PRECISA CALCULAR AS METRICAS PRA CADA INTERFACE TODA VEZ
 
 | arquivo | onde roda | função |
 |---|---|---|
