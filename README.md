@@ -1,7 +1,7 @@
 # Aquaviário: comparação de interfaces de rede entre Raspberry Pi e servidor
 
 Um Raspberry Pi embarcado tem Ethernet, Wi-Fi e um modem 4G ao mesmo tempo, e nenhum dos três é sempre o melhor caminho: a Ethernet só existe atracado, o Wi-Fi vai até a borda da marina e o 4G oscila conforme a embarcação se desloca.
-O projeto se propõe a medir os três enlaces continuamente, separando ida de volta e latência de perda, para que a decisão de qual interface carrega o tráfego seja tomada com base na qualidade do sinal. A sondagem vem primeiro; em cima dela ficam o cálculo de nota (`score.py`) e o failover automático (`decision_engine.py`).
+O projeto se propõe a medir os três enlaces continuamente, separando ida de volta e latência de perda, para que a decisão de qual interface carrega o tráfego seja tomada com base na qualidade do sinal. A sondagem vem primeiro; em cima dela ficam a estimativa de quão provável é cada interface estar boa (`estimador.py`) e o failover automático (`decision_engine.py`).
 
 O agente roda no Pi e um refletor roda no servidor do laboratório:
 
@@ -46,8 +46,10 @@ estarem sincronizados (ver seção 2 mais abaixo).
 | `reflector_server.py` | servidor do lab | refletor UDP + controle TCP |
 | `agent_rpi.py` | Raspberry Pi | dispara os testes, faz o rodízio das interfaces |
 | `analisar.py` | qualquer uma | consolida o `.jsonl` e ranqueia as interfaces |
-| `score.py` | Raspberry Pi | transforma o histórico de uma interface numa nota 0-100 |
-| `decision_engine.py` | Raspberry Pi | sonda continuamente, pontua e troca a rota default (failover) |
+| `score.py` | qualquer uma | nota 0-100 por interface (usada pelo `calibrar_pesos.py`) |
+| `estimador.py` | Raspberry Pi | probabilidade de cada interface estar "boa" (Beta com esquecimento) |
+| `decision_engine.py` | Raspberry Pi | heartbeat + sondagem contínua, ranking e troca da rota default (failover) |
+| `test_failover.py` | qualquer uma | cenários de failover com tempo simulado, sem rede/root |
 | `telemetry_client.py` | Raspberry Pi | fila local (SQLite) + envio store-and-forward pro laboratório |
 | `telemetry_server.py` | servidor do lab | endpoint HTTP + banco (SQLite) + dashboard com gráficos |
 | `testbed.sh` | qualquer uma | bancada sem hardware, namespaces simulando as 3 interfaces |
@@ -277,7 +279,7 @@ sudo ./testbed.sh up            # monta + sobe refletor e telemetria (ficam no a
 sudo ./testbed.sh status        # endereços, rotas, regras e qdiscs
 sudo ./testbed.sh check         # ping pelos 3 caminhos
 sudo ./testbed.sh run           # roda o agente (usa o refletor/telemetria do 'up')
-sudo ./testbed.sh decide        # roda a engine de decisão (score/failover)
+sudo ./testbed.sh decide        # roda a engine de decisão (estimador/failover)
 sudo ./testbed.sh flap IF MODO  # simula IF piorando/melhorando: down|up|bad|good
 sudo ./testbed.sh down          # derruba refletor/telemetria e remove tudo
 ```
@@ -312,63 +314,104 @@ barramento USB do Pi, limite de CPU do ARM e timestamps de hardware. Ou seja: a
 bancada valida a **corretude do código**; ela não decide qual interface é melhor.
 Essa resposta só vem do Pi conectado nos enlaces reais.
 
-## Score e failover (protótipo)
+## Failover: estimador probabilístico + detecção rápida
 
-`score.py` e `decision_engine.py` são a próxima camada, em cima da sondagem:
-decidir sozinho qual interface deve carregar o tráfego real, e trocar
-automaticamente quando um link piora.
+`estimador.py` e `decision_engine.py` são a camada em cima da sondagem:
+manter um ranking das interfaces, com uma alternativa já escolhida, e trocar
+a rota default quando a ativa cai ou quando outra é comprovadamente melhor.
 
-- **`score.py`**, puro, sem rede: transforma o histórico recente de uma
-  interface (RTT, jitter, perda total, vazão de *subida*) em uma nota 0-100:
-  qualidade da amostra mais recente, **escalada** pela estabilidade das
-  últimas rodadas (0,7 a 1,0×), menos a penalidade por falhas recentes
-  (decai com o tempo, uma falha agora pesa mais que uma de 5 rodadas
-  atrás). A estabilidade multiplica em vez de somar de propósito: um link
-  ruim porém constante não ganha pontos de graça por ser estável. Testável
-  isolado, sem raspberry nem bancada nenhuma.
-- **`decision_engine.py`** roda no Raspberry Pi ao lado do `agent_rpi.py`, reaproveita
-  o mesmo `run_test()`. Cada ciclo sonda todas as interfaces, calcula o score
-  de cada uma e, se o melhor link atual **não** é o ativo, só troca a rota
-  default (`ip route replace default ... dev <iface>`) depois que o candidato
-  ficou à frente por `--margin` pontos durante `--hysteresis-rounds` ciclos
-  seguidos. Sem histerese o sistema fica trocando de link a cada rodada por
-  ruído estatístico. Cada troca (e cada ciclo) fica registrada em
-  `decisao.jsonl`. Se `ip route replace` falhar, a engine registra
-  `failover_falhou`/`ativacao_inicial_falhou` e continua tentando no ciclo
-  seguinte, em vez de morrer.
-- A histerese (atraso) vale para o caso "outro link parece um pouco melhor". Quando a
-  interface **ativa** simplesmente cai (timeout, sem resposta) por
-  `--fail-fast-rounds` ciclos seguidos, a engine troca na hora pro melhor
-  link que ainda responde, sem esperar `--margin`/`--hysteresis-rounds`;
-  fica registrado como `failover_rapido`. O `connect()` de cada sondagem
-  usa um timeout curto (`--connect-timeout`, 4 s) só pra detectar link
-  morto rápido, sem segurar o ciclo inteiro no `--timeout`.
-- O teste de vazão TCP da engine é **best-effort**: só roda a cada
-  `--tcp-every` ciclos, é pulado quando a sondagem barata já mostrou o link
-  degradado (RTT/perda altos), e se não terminar dentro do timeout as
-  métricas de latência/jitter/perda daquele ciclo continuam valendo (a
-  rodada não vira "falha"). Entre medições o score reaproveita a última
-  vazão conhecida só enquanto ela é recente e o link não piorou; assim um
-  link que acabou de degradar não fica com a nota "segurada" por um número
-  de vazão velho.
-- A sondagem continua testando **todas** as interfaces o tempo todo (bind
-  explícito por socket, como sempre); só o tráfego comum da aplicação, que
-  não faz esse bind, segue a rota default trocada pela engine. É assim que
-  dá pra monitorar os links inativos sem tirá-los do ar.
+**O que é uma interface "boa".** Uma sondagem completa é *boa* se cumprir
+todos os limites da aplicação (telemetria/store-and-forward do Gateway):
+RTT p50 ≤ 150 ms, perda ≤ 2 %, jitter ≤ 30 ms e, quando a vazão foi medida,
+subida ≥ 1 Mbps. Sondagem que falhou, ou interface sem conexão, conta como
+*ruim*. O critério é absoluto: se todas estiverem ruins, nenhuma é "boa",
+mesmo a melhor do ranking (o log avisa com `nenhuma_interface_boa`). Os
+limites são parâmetros (`--boa-rtt-ms`, `--boa-perda-pct`, `--boa-jitter-ms`,
+`--boa-tput-mbps`) e a justificativa de cada um está na docstring do
+`estimador.py`.
 
-Dá pra testar na bancada, sem raspberry: `sudo ./testbed.sh decide` sobe a engine
-dentro do netns `rpi`; em outro terminal, `sudo ./testbed.sh flap wlan0 bad`
-degrada o `wlan0` na hora (300ms±100ms, 60% de perda) e dá pra ver a engine
-detectar e trocar pra `eth0` no log. `sudo ./testbed.sh flap wlan0 good`
-devolve o `wlan0` ao perfil original.
+**O modelo.** Cada sondagem é um sorteio boa/ruim com probabilidade *p*
+desconhecida, e a crença sobre *p* é uma Beta(a, b), em que a = boas + 1 e
+b = ruins + 1. A estimativa `p` é, no fundo, a fração de sondagens boas,
+puxada para 0,5 quando há poucos dados. Para as observações recentes
+pesarem mais, `a` e `b` decaem para a priori com meia-vida de
+`--half-life` (120 s). Isso também cuida das medições velhas: sem sondagem
+nova, a estimativa volta para 0,5 e a incerteza cresce. O ranking usa
+`p_cons = p − 1 desvio-padrão`, de modo que interface com pouco histórico
+ou histórico velho não passa na frente de uma comprovada. Não é score/100:
+`p` tem leitura direta, "fração recente das sondagens que cumpriram os
+limites da aplicação". O `score.py` continua aí para o `calibrar_pesos.py`,
+mas não decide mais nada.
+
+**Detecção rápida, separada da qualidade.** A thread principal manda a
+cada `--hb-interval` (0,5 s) um heartbeat UDP de 40 bytes por interface
+(o refletor já devolve qualquer `T_TEST`, não precisou mudar o servidor) e
+lê a portadora em `/sys/class/net/<if>/operstate`. A interface está *morta*
+se perdeu a portadora ou se ficou sem resposta por `--hb-timeout` (2 s). Ela
+volta a ser elegível depois de `--hb-recover` (3) respostas seguidas.
+Interface morta fica fora do ranking, mesmo com histórico excelente. As
+sondagens completas (que podem levar dezenas de segundos com o teste de
+vazão) rodam em outra thread, e o envio de telemetria em uma terceira:
+nenhuma das duas atrasa a decisão.
+
+**Quando troca** (motivo registrado no campo `motivo` de cada `failover`):
+
+| motivo | gatilho | espera |
+|---|---|---|
+| `ativa_caida` | ativa morta (heartbeat/portadora) | nenhuma: vai para a alternativa pré-selecionada |
+| `degradacao_confirmada` | ativa com perda > 20 % ou RTT > 300 ms em `--fail-fast-rounds` (2) sondagens completas seguidas | nenhuma, para a melhor viva cuja última sondagem não está degradada |
+| `melhoria_qualidade` | `p_cons` do candidato ≥ `p` da ativa + `--margin` (0,15) | `--confirm-s` (30 s) seguidos, e só com medição atualizada |
+| `recuperacao_apos_queda_total` | nenhuma estava viva e uma voltou | nenhuma |
+
+- **Nenhuma interface viva:** a rota fica como está (não há para onde ir; a
+  telemetria espera na fila local), o log registra `sem_interface_disponivel`
+  uma vez, e a engine troca para a primeira interface que voltar.
+- **Medição desatualizada** (mais velha que `--max-age`, 90 s): não serve
+  para justificar troca por melhoria, mas a interface continua podendo ser a
+  alternativa se a ativa cair, já que estar viva é melhor que nada. Ela
+  aparece no ranking com o `p` já decaído pela idade e `desatualizada: true`
+  no log.
+- **Interfaces inativas** continuam sendo sondadas (bind explícito por
+  socket) e recebendo heartbeat. O log registra `interface_caiu` e
+  `interface_voltou` para todas, não só para a ativa.
+- Partida: enquanto não há medição, o empate segue a ordem de `--ifaces`.
+
+**Log (`decisao.jsonl`).** A cada ciclo de sondagem sai uma linha `status`
+com `ativo`, `alternativa` e, por interface, `p`, `p_cons`, `n_eff`
+(sondagens efetivas que ainda pesam), `idade_s` da última medição, `viva` e
+`desatualizada`, mais as `entradas` cruas (o formato que o
+`calibrar_pesos.py` lê). Cada troca grava duas medidas que **não** são a
+mesma coisa:
+- `deteccao_s`: tempo entre a última resposta da ativa e a decisão, ou
+  seja, o limite superior do tempo para *perceber* a queda (o `gatilho` diz
+  se foi o heartbeat ou a portadora);
+- `troca_rota_ms`: quanto o `ip route replace` levou para *mudar a rota*.
+
+Quanto tempo o tráfego da aplicação fica sem passar, de ponta a ponta,
+depende ainda do que a aplicação faz com conexões abertas: uma conexão TCP
+aberta antes da troca fica presa ao IP de origem da interface antiga pela
+`ip rule`, e só se recupera quando a aplicação reconecta. Isso só se mede
+no Pi, com a aplicação real.
+
+Para testar na bancada, sem Raspberry: `sudo ./testbed.sh decide` sobe a
+engine dentro do netns `rpi`. Em outro terminal, `sudo ./testbed.sh flap
+eth0 down` (queda de portadora) ou `flap eth0 bad` (300 ms ± 100 ms e 60 %
+de perda) provocam a troca, e `up`/`good` desfazem. Os cenários do
+`Decisor` (queda total, degradação gradual, recuperação, oscilação,
+alternativa desatualizada, telemetria fora do ar) rodam sem rede e sem
+root: `python3 test_failover.py`.
 
 ```bash
 sudo python3 decision_engine.py --server 10.99.0.1 \
     --ifaces eth0,wlan0,usb0 \
     --gateways eth0=10.0.1.2,wlan0=10.0.2.2,usb0=10.0.3.2 \
-    --interval 5 --window 10 --margin 8 --hysteresis-rounds 3 \
     --log decisao.jsonl
 ```
+
+Os valores padrão (`--hb-timeout`, `--half-life`, `--margin`,
+`--confirm-s`, limites de "boa") são pontos de partida, não calibração. Um
+handover de 4G/5G, por exemplo, pode deixar o link mudo por cerca de 1 s
+sem ele ter caído. Ajuste com dado de campo.
 
 No raspberry real, `--gateways` leva os gateways de verdade de cada interface
 (mesmos IPs usados na seção 3). Ao iniciar, a engine confere se cada
@@ -379,8 +422,8 @@ de deixar aparecer só como timeout depois. Interface sem gateway em
 o destino estiver na mesma sub-rede, pra Ethernet/Wi-Fi/4G de verdade,
 sempre passe o gateway.
 
-Ainda não implementado: persistir o estado entre reinícios do processo.
-Ele sempre começa sem link ativo e escolhe o melhor da primeira rodada.
+Ainda não implementado: persistir as estimativas entre reinícios do
+processo. A engine sempre começa da priori (p = 0,5 para todas).
 
 ## Banco de telemetria e store-and-forward
 
