@@ -31,6 +31,38 @@ from protocol import (T_REFLECT, T_TEST, Conn, Jitter, mono_ns, now_ns,
 
 SIOCGIFADDR = 0x8915
 BULK_BLOCK = os.urandom(262144)
+# /run e não /tmp: só root escreve, e o fs.protected_regular do /tmp impede
+# root de abrir um arquivo criado por outro usuário lá
+TRAVA_SONDAGEM = "/run/aquaviario-sondagem.lock"
+_trava = None
+
+
+def travar_sondagem(quem: str) -> None:
+    """agent_rpi.py e decision_engine.py não podem sondar ao mesmo tempo no
+    mesmo Pi: os testes de vazão de um saturam o link ativo do outro (o
+    heartbeat do engine acusa queda que não houve) e o consumo de dados
+    dobra. Sai com erro se o outro já estiver rodando. A trava (flock) some
+    sozinha quando o processo termina, mesmo morto com kill -9."""
+    global _trava
+    try:
+        _trava = open(TRAVA_SONDAGEM, "a+")
+    except OSError as e:
+        print(f"aviso: não deu pra criar {TRAVA_SONDAGEM} ({e}); sem como conferir "
+              f"se agent_rpi/decision_engine já estão rodando (rode com sudo).",
+              file=sys.stderr)
+        return
+    try:
+        fcntl.flock(_trava, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        _trava.seek(0)
+        raise SystemExit(
+            f"erro: já tem sondagem rodando neste Pi ({_trava.read().strip() or '?'}). "
+            f"agent_rpi.py e decision_engine.py não rodam juntos: um satura o link do "
+            f"outro e o consumo de dados dobra. Pare o outro antes "
+            f"(ex.: sudo systemctl stop aquaviario-engine).")
+    _trava.truncate(0)
+    _trava.write(f"{quem}, pid {os.getpid()}")
+    _trava.flush()
 
 
 # ----------------------------------------------------------------------------
@@ -391,6 +423,7 @@ def main():
     ifaces = [i.strip() for i in args.ifaces.split(",") if i.strip()]
     if os.geteuid() != 0:
         print("aviso: sem root o SO_BINDTODEVICE falha; use sudo.", file=sys.stderr)
+    travar_sondagem("agent_rpi.py")
 
     fila = None
     if args.telemetry_url:

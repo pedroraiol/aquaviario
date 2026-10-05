@@ -26,6 +26,15 @@ from protocol import (T_REFLECT, T_TEST, Conn, Jitter, mono_ns, now_ns,
 SESSIONS: dict[int, "SessionState"] = {}
 SESSIONS_LOCK = threading.Lock()
 BULK_BLOCK = os.urandom(262144)   # dados aleatórios: evita compressão no caminho
+# Pi que some no meio de uma sessão (o link dele caiu: não chega FIN nem RST)
+# deixava a thread do controle presa no recv() pra sempre, com a sessão junto.
+# Timeout simples no recv não serve: durante o teste UDP o controle fica
+# parado por count/pps + drain, que pode ser minutos. Keepalive pergunta ao
+# kernel do Pi mesmo com o canal ocioso (Pi vivo responde sozinho); o
+# USER_TIMEOUT cobre dado enviado e nunca confirmado (ex.: no meio do tcp_down).
+# Pi sumido => conexão derrubada em ~KEEPIDLE + KEEPCNT*KEEPINTVL = 60 s.
+KEEPIDLE_S, KEEPINTVL_S, KEEPCNT = 30, 10, 3
+USER_TIMEOUT_MS = 60_000
 
 
 class SessionState:
@@ -166,6 +175,11 @@ def udp_reflector(bind: str, port: int, default_resp_size: int) -> None:
 class ControlHandler(socketserver.BaseRequestHandler):
     def handle(self):
         self.request.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self.request.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        for opt, val in (("TCP_KEEPIDLE", KEEPIDLE_S), ("TCP_KEEPINTVL", KEEPINTVL_S),
+                         ("TCP_KEEPCNT", KEEPCNT), ("TCP_USER_TIMEOUT", USER_TIMEOUT_MS)):
+            if hasattr(socket, opt):          # opções do Linux; o servidor do lab é Linux
+                self.request.setsockopt(socket.IPPROTO_TCP, getattr(socket, opt), val)
         conn = Conn(self.request)
         session = None
         iface_hint = None

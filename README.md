@@ -267,9 +267,12 @@ WantedBy=multi-user.target
 No servidor, o mesmo padrão com `ExecStart=/usr/bin/python3 /opt/aquaviario/reflector_server.py`.
 
 Em produção, o que roda no Pi é o **engine**, não o agente: o engine já
-sonda tudo. Rodar os dois juntos dobra o consumo de dados, e os testes de
-vazão de 25 MB do agente saturam o link ativo a ponto de o heartbeat achar
-que ele caiu. `/etc/systemd/system/aquaviario-engine.service`:
+sonda tudo. Rodar os dois juntos dobraria o consumo de dados, e os testes de
+vazão de 25 MB do agente saturariam o link ativo a ponto de o heartbeat
+achar que ele caiu. Por isso os dois usam uma trava em
+`/run/aquaviario-sondagem.lock`, e o segundo a subir sai com erro dizendo
+quem já está rodando. Para caracterizar os links com o agente, pare o
+engine antes. `/etc/systemd/system/aquaviario-engine.service`:
 
 ```ini
 [Unit]

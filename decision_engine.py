@@ -77,7 +77,7 @@ import time
 import traceback
 from datetime import datetime, timezone
 
-from agent_rpi import bind_iface, iface_ipv4, run_test
+from agent_rpi import bind_iface, iface_ipv4, run_test, travar_sondagem
 from estimador import LIMITES_BOA, MEIA_VIDA_S, Estimativa, violacoes
 from protocol import T_REFLECT, T_TEST, mono_ns, pack, unpack
 from score import RTT_RUIM_MS
@@ -735,6 +735,7 @@ def main():
     if os.geteuid() != 0:
         print("aviso: sem root o SO_BINDTODEVICE e a troca de rota falham; use sudo.",
               file=sys.stderr)
+    travar_sondagem("decision_engine.py")
 
     # monta as tabelas por interface e depois confere: um erro de ip rule /
     # tabela ou gateway ausente só ia aparecer depois como timeout genérico.
