@@ -186,6 +186,13 @@ localmente via socket, não encaminha nada.)
 > as interfaces, mas sim ARP. Tem que garantir caminhos distintos (switch, AP, operadora)
 > ou o teste não mede o que você quer.
 
+> Com o `decision_engine.py` rodando, as tabelas acima não precisam ser
+> mantidas na mão. Ele monta e mantém uma tabela por interface
+> (`--route-table-base` 200 + posição em `--ifaces`) e a `ip rule from <ip>`
+> de cada uma, e recoloca tudo quando o kernel apaga (interface que cai e
+> volta, modem que reconecta) ou quando o IP muda. Os comandos desta seção
+> continuam necessários para rodar o `agent_rpi.py` sozinho.
+
 ## 4. Rodar o agente
 
 ```bash
@@ -258,6 +265,33 @@ WantedBy=multi-user.target
 ```
 
 No servidor, o mesmo padrão com `ExecStart=/usr/bin/python3 /opt/aquaviario/reflector_server.py`.
+
+Em produção, o que roda no Pi é o **engine**, não o agente: o engine já
+sonda tudo. Rodar os dois juntos dobra o consumo de dados, e os testes de
+vazão de 25 MB do agente saturam o link ativo a ponto de o heartbeat achar
+que ele caiu. `/etc/systemd/system/aquaviario-engine.service`:
+
+```ini
+[Unit]
+Description=Engine de failover
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/aquaviario
+ExecStart=/usr/bin/python3 /opt/aquaviario/decision_engine.py --server 192.168.0.10 \
+    --ifaces eth0,wlan0,usb0 --gateways eth0=192.168.0.1,wlan0=192.168.1.1,usb0=192.168.8.1 \
+    --log /var/log/aquaviario/decisao.jsonl \
+    --telemetry-url http://192.168.0.10:8080/telemetria \
+    --telemetry-db /var/lib/aquaviario/fila.db
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
 
 ## Bancada de testes sem hardware (`testbed.sh`)
 
@@ -352,7 +386,29 @@ volta a ser elegível depois de `--hb-recover` (3) respostas seguidas.
 Interface morta fica fora do ranking, mesmo com histórico excelente. As
 sondagens completas (que podem levar dezenas de segundos com o teste de
 vazão) rodam em outra thread, e o envio de telemetria em uma terceira:
-nenhuma das duas atrasa a decisão.
+nenhuma das duas atrasa a decisão. Um erro inesperado numa dessas threads
+vira o evento `erro_thread` no log, e a thread segue no ciclo seguinte em
+vez de morrer em silêncio. Se não der para gravar o log (disco cheio), o
+failover continua funcionando, só avisa no `stderr`.
+
+**Rotas.** Quando uma interface cai e volta (down/up, modem reconectando),
+o kernel apaga as rotas dela, e quando o IP muda, a `ip rule from <ip>` fica
+apontando para o IP antigo. A cada `--route-check-s` (5 s), e na hora em que
+alguma interface cai ou volta, o engine confere e recoloca a tabela de cada
+interface, a regra dela e a rota default da ativa. Cada correção sai no log
+como `rotas_reaplicadas`.
+
+**Consumo de dados.** No celular, a sondagem tem custo direto. Por isso os
+padrões são econômicos: 100 pacotes por sondagem, `--interval` de 15 s, e
+teste de vazão só de subida (a descida não entra no modelo), no máximo a
+cada `--tcp-every-s` (30 min) por interface. Ao iniciar, o engine imprime
+quanto ele próprio deve gastar **por interface**: com esses padrões e 3
+interfaces, ~300 MB/dia (~9 GB/mês), sendo ~180 de sondagem, ~100 de vazão
+e ~24 de heartbeat. Antes eram ~5 GB/dia. A estimativa é grosseira: não
+conta o cabeçalho TCP nem a telemetria, que só sai pela ativa. Menos
+consumo custa resolução: sondagens mais espaçadas dão menos amostras ao
+estimador e deixam a confirmação de degradação mais lenta. A detecção de
+queda pelo heartbeat não muda.
 
 **Quando troca** (motivo registrado no campo `motivo` de cada `failover`):
 
@@ -445,7 +501,8 @@ perder dado quando a conexão cai no meio do caminho.
   `reflector_server.py` (é outra coisa: o reflector *mede* o enlace, este
   *guarda* o que foi medido).
   - `POST /telemetria` recebe um registro (mesmo JSON que o agente já grava
-    localmente) e insere no banco.
+    localmente) e insere no banco. Se o registro tiver a chave `evento`, é
+    um evento de decisão do engine e vai para a tabela `eventos`.
   - `GET /telemetria?limit=&iface=` devolve os últimos registros em JSON.
   - `GET /` é o dashboard: gráficos de RTT, jitter, perda e vazão por
     interface, cada uma com sua cor fixa e o valor de cada ponto disponível
@@ -453,9 +510,17 @@ perder dado quando a conexão cai no meio do caminho.
     gráficos são SVG gerado em Python, sem nenhuma biblioteca externa nem
     JavaScript, então funcionam mesmo sem internet no laboratório. Quando
     uma métrica não foi medida naquela rodada (a vazão, por exemplo, só roda
-    a cada `--tcp-every` ciclos), o gráfico mostra a lacuna em vez de traçar
-    uma linha enganosa ligando os dois lados. A página recarrega sozinha a
-    cada 5s enquanto há dado novo chegando.
+    a cada `--tcp-every-s`), o gráfico mostra a lacuna em vez de traçar
+    uma linha enganosa ligando os dois lados. O eixo do tempo é o horário da
+    **medição** no Pi, não o da chegada: depois de uma queda o
+    store-and-forward entrega todo o atraso de uma vez, e a queda aparece
+    como lacuna. Com o `decision_engine.py` mandando telemetria, a página
+    também mostra a interface ativa e a alternativa, as estimativas de cada
+    interface (`p`, `p_cons`, idade, viva) e os eventos de decisão
+    recentes: trocas com motivo e tempos, interfaces que caíram ou
+    voltaram, rotas reaplicadas, erros de thread. Interface sem conexão
+    também gera registro (`erro: sem_conexao`). A página recarrega sozinha
+    a cada 5 s enquanto há dado novo chegando.
   - `GET /saude` é o health check que o raspberry usa antes de tentar esvaziar a fila.
 - **`telemetry_client.py`**, fila local em SQLite (`Fila`), usada pelo
   `agent_rpi.py` e pelo `decision_engine.py` via `--telemetry-url`. Cada

@@ -11,6 +11,7 @@ campos deteccao_s / troca_rota_ms do decisao.jsonl.
 from __future__ import annotations
 
 import os
+import queue
 import random
 import socket
 import tempfile
@@ -265,7 +266,8 @@ def test_telemetria_indisponivel_nao_bloqueia():
         db = os.path.join(tmp, "fila.db")
         args = SimpleNamespace(telemetry_db=db, telemetry_url=url)
         fila = Fila(db, url)     # a conexão da "thread de sondagem"
-        threading.Thread(target=enviar_telemetria, args=(args,), daemon=True).start()
+        threading.Thread(target=enviar_telemetria, args=(args, queue.Queue(), print),
+                         daemon=True).start()
         time.sleep(0.2)
         s = Sim(["a", "b"])
         pior_enfileirar, pior_passo = 0.0, 0.0

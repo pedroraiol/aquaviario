@@ -316,14 +316,17 @@ def run_test(args, iface: str, rnd: int) -> dict:
                     "mbps_agente": round(args.tcp_bytes * 8 / t_up / 1e6, 3) if t_up > 0 else None,
                 }
 
-                ctl.send_json({"cmd": "tcp_down", "bytes": args.tcp_bytes})
-                ack = ctl.recv_json()
-                n, secs = ctl.recv_exact_timed(int(ack["bytes"]))
-                down = ctl.recv_json()
-                result["tcp_descida"] = {
-                    "mbps_agente": round(n * 8 / secs / 1e6, 3) if secs > 0 else None,
-                    "segundos_servidor": down.get("segundos_servidor"),
-                }
+                # o decision_engine só usa a subida: pular a descida corta
+                # pela metade o tráfego do teste (dado caro no celular)
+                if not getattr(args, "tcp_so_subida", False):
+                    ctl.send_json({"cmd": "tcp_down", "bytes": args.tcp_bytes})
+                    ack = ctl.recv_json()
+                    n, secs = ctl.recv_exact_timed(int(ack["bytes"]))
+                    down = ctl.recv_json()
+                    result["tcp_descida"] = {
+                        "mbps_agente": round(n * 8 / secs / 1e6, 3) if secs > 0 else None,
+                        "segundos_servidor": down.get("segundos_servidor"),
+                    }
             except (OSError, ConnectionError, ValueError, KeyError) as e:
                 fase2_ok = False
                 result.setdefault("tcp_subida",

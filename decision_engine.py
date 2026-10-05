@@ -15,12 +15,23 @@ Três fluxos independentes, pra nenhum travar o outro:
                        interface está VIVA?" em ~--hb-timeout segundos. Em
                        seguida decide e, se precisar, troca a rota.
   sondagem             o run_test() completo de sempre (RTT, jitter, perda,
-                       vazão a cada N ciclos), interface por interface. Cada
+                       vazão de subida a cada --tcp-every-s), interface por
+                       interface. Cada
                        resultado vira uma observação boa/ruim no estimador.
                        Pode levar dezenas de segundos por ciclo; não importa,
                        a detecção de queda não depende dele.
-  telemetria           esvazia a fila store-and-forward; com o servidor fora,
-                       o POST que espera o timeout trava só esta thread.
+  telemetria           esvazia a fila store-and-forward (sondagens + eventos
+                       de decisão); com o servidor fora, o POST que espera o
+                       timeout trava só esta thread.
+
+Um erro inesperado numa thread vira log `erro_thread` e a thread segue no
+próximo ciclo, em vez de morrer calada e deixar as estimativas envelhecendo.
+
+Rotas: o kernel apaga as rotas de uma interface quando ela cai e volta
+(down/up, modem reconectando) e a `ip rule from <ip>` fica velha quando o IP
+muda. A thread principal confere a cada --route-check-s e recoloca a tabela
+por interface (--route-table-base + posição em --ifaces) e a rota default
+da ativa; cada correção vira log `rotas_reaplicadas`.
 
 Política de troca:
   - ativa MORTA (sem portadora ou sem heartbeat há --hb-timeout): troca na
@@ -55,6 +66,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import queue
 import random
 import select
 import socket
@@ -62,6 +74,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from datetime import datetime, timezone
 
 from agent_rpi import bind_iface, iface_ipv4, run_test
@@ -123,6 +136,7 @@ class _ArgsView:
     def __init__(self, args: argparse.Namespace, tcp_bytes: int):
         self.__dict__.update(vars(args))
         self.tcp_bytes = tcp_bytes
+        self.tcp_so_subida = True     # só a subida entra no estimador
 
 
 def parse_gateways(s: str) -> dict:
@@ -137,12 +151,12 @@ def parse_gateways(s: str) -> dict:
 
 
 def resumo(result: dict, tput_cache: dict, iface: str,
-           rodada: int, tcp_every: int) -> dict:
+           agora: float, validade_s: float) -> dict:
     """Extrai do resultado do run_test() as métricas que entram no estimador.
 
-    tput_cache[iface] = (rodada_da_medicao, mbps). A vazão só é medida a
-    cada `tcp_every` rodadas; entre medições reaproveita a última, mas só
-    se ela for recente (<= tcp_every rodadas) E o link não estiver
+    tput_cache[iface] = (instante_da_medicao, mbps). A vazão só é medida de
+    tempos em tempos; entre medições reaproveita a última, mas só
+    se ela for recente (<= validade_s) E o link não estiver
     degradado agora. Assim um link que acabou de piorar não fica
     "segurado" por um número de vazão velho e bom; passado o prazo a
     vazão vira None e o critério de vazão deixa de ser avaliado.
@@ -160,12 +174,12 @@ def resumo(result: dict, tput_cache: dict, iface: str,
         medido = subida.get("mbps_servidor")
         if medido is not None:
             tput = medido
-            tput_cache[iface] = (rodada, medido)
+            tput_cache[iface] = (agora, medido)
         else:
             tput_cache.pop(iface, None)      # mediu e falhou: não confia no valor antigo
     if tput is None and not _link_degradado(rtt_p50, perda_total):
         cache = tput_cache.get(iface)
-        if cache and rodada - cache[0] <= max(1, tcp_every):
+        if cache and agora - cache[0] <= validade_s:
             tput = cache[1]
     return {
         "ok": True,
@@ -188,6 +202,90 @@ def set_default_route(iface: str, gateway: str | None) -> bool:
         print(f"  ! falha ao trocar rota default para {iface}: {detalhe}",
               file=sys.stderr)
         return False
+
+
+def _ip(*args: str) -> str:
+    return subprocess.run(["ip", *args], check=True, capture_output=True,
+                          text=True, timeout=2).stdout
+
+
+def _ip_json(*args: str) -> list:
+    try:
+        return json.loads(_ip("-j", *args) or "[]")
+    except subprocess.CalledProcessError:
+        return []          # ex.: tabela que ainda não existe
+
+
+def reconciliar_rotas(ifaces, gateways, tabela_base, ativo) -> list[str]:
+    """Recoloca o que sumiu: por interface com IP, a rota default na tabela
+    `tabela_base + posição` e a `ip rule from <ip atual>` pra ela (apagando
+    regra de IP antigo); e a rota default (métrica 0) da ativa na tabela
+    principal. Sem a tabela, heartbeat/sondagem daquela interface não acham
+    caminho e ela nunca mais "volta"; sem a default, a aplicação fica sem
+    rota com o engine achando que está tudo certo. Idempotente; devolve a
+    lista do que corrigiu (vazia = estava tudo certo).
+
+    Interface sem portadora é pulada: o kernel recusa rota por ela ("Nexthop
+    has invalid gateway"), e ela é refeita na passada em que voltar. Erro
+    numa interface não impede de conferir as outras."""
+    feito = []
+    erros = (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, ValueError)
+    try:
+        regras = _ip_json("rule", "show") if tabela_base else []
+    except erros as e:
+        regras, tabela_base = [], 0
+        feito.append(f"erro lendo ip rule: {e}")
+    for k, iface in enumerate(ifaces if tabela_base else []):
+        if not carrier_ok(iface):
+            continue
+        try:
+            try:
+                ip = iface_ipv4(iface)
+            except OSError:
+                continue                     # sem IP ainda: nada pra apontar
+            tabela, gw = str(tabela_base + k), gateways.get(iface)
+            if not any(r.get("dst") == "default" and r.get("dev") == iface
+                       and r.get("gateway") == gw for r in _ip_json("route", "show", "table", tabela)):
+                _ip("route", "replace", "default", *(["via", gw] if gw else []),
+                    "dev", iface, "table", tabela)
+                feito.append(f"{iface}: default na tabela {tabela}")
+            minhas = [r for r in regras if str(r.get("table")) == tabela]
+            for r in minhas:
+                if r.get("src") != ip:       # IP mudou (DHCP/modem reconectou)
+                    _ip("rule", "del", "from", r["src"], "table", tabela)
+                    feito.append(f"{iface}: removida regra do IP antigo {r['src']}")
+            if not any(r.get("src") == ip for r in minhas):
+                _ip("rule", "add", "from", ip, "table", tabela, "priority", tabela)
+                feito.append(f"{iface}: regra from {ip} -> tabela {tabela}")
+        except erros as e:
+            feito.append(f"{iface}: erro: {(getattr(e, 'stderr', '') or str(e)).strip()}")
+    if ativo is not None and carrier_ok(ativo):
+        gw = gateways.get(ativo)
+        try:
+            if not any(r.get("dev") == ativo and r.get("gateway") == gw and not r.get("metric")
+                       for r in _ip_json("route", "show", "default")):
+                if set_default_route(ativo, gw):
+                    feito.append(f"{ativo}: rota default da ativa recolocada")
+        except erros as e:
+            feito.append(f"{ativo}: erro: {(getattr(e, 'stderr', '') or str(e)).strip()}")
+    return feito
+
+
+def estimar_consumo(args, n_ifaces: int) -> dict:
+    """Estimativa GROSSEIRA do tráfego que a própria engine gera em CADA
+    interface, em MB/dia (sem cabeçalho TCP nem telemetria, que só sai pela
+    ativa). Serve pra dimensionar contra a franquia do chip."""
+    ip_udp = 28
+    ciclo = n_ifaces * (args.count / args.pps + args.drain + 0.3) + args.interval
+    por_dia = {
+        "sondagem": args.count * (args.size + args.resp_size + 2 * ip_udp) / ciclo,
+        "vazao": args.tcp_bytes / args.tcp_every_s if args.tcp_every_s > 0 else 0.0,
+        "heartbeat": 2 * (40 + ip_udp) / args.hb_interval,
+    }
+    out = {k: round(v * 86400 / 1e6) for k, v in por_dia.items()}
+    out["total"] = sum(out.values())
+    out["ciclo_s"] = round(ciclo, 1)
+    return out
 
 
 def log_line(fh, obj: dict) -> None:
@@ -459,63 +557,97 @@ class Decisor:
 # ----------------------------------------------------------------------------
 # Threads
 # ----------------------------------------------------------------------------
+def _erro_thread(log, nome: str, e: Exception) -> None:
+    """Thread não pode morrer calada: o engine seguiria trocando rota com
+    estimativas cada vez mais velhas (ou sem telemetria) sem ninguém saber."""
+    traceback.print_exc()
+    log("erro_thread", thread=nome, erro=f"{type(e).__name__}: {e}")
+
+
 def sondar(args, ifaces, decisor: Decisor, log) -> None:
     fila = None
     if args.telemetry_url:
         # conexão sqlite própria desta thread; quem envia é a thread de telemetria
         from telemetry_client import Fila
         fila = Fila(args.telemetry_db, args.telemetry_url)
+    host = socket.gethostname()
     tput_cache: dict = {}
+    ultimo_tput: dict = {}
     rodada = 0
     time.sleep(args.hb_timeout)      # dá tempo do heartbeat dizer quem está vivo
     while True:
         rodada += 1
-        for iface in ifaces:
-            if not decisor.viva[iface]:
-                # sem conexão também é observação: o link NÃO estava bom agora.
-                # Não gasta o connect-timeout tentando sondar.
-                decisor.medicao(iface, {"ok": False, "motivo": "sem_conexao"}, time.monotonic())
-                continue
-            testa_tput = args.tcp_every > 0 and rodada % args.tcp_every == 0
-            # se a sondagem anterior já mostrou o link degradado, não gasta um
-            # teste de vazão nele: só travaria esta thread até o timeout.
-            if testa_tput and decisor.degrad[iface]:
-                testa_tput = False
-            call_args = _ArgsView(args, args.tcp_bytes if testa_tput else 0)
-            decisor.vazao_em = iface if testa_tput else None
-            try:
-                r = run_test(call_args, iface, rodada)
-                resumo_r = resumo(r, tput_cache, iface, rodada, args.tcp_every)
-            except Exception as e:
-                print(f"  ! {iface} falhou: {type(e).__name__}: {e}", file=sys.stderr)
-                r = {"ts_utc": datetime.now(timezone.utc).isoformat(),
-                     "rodada": rodada, "iface": iface,
-                     "erro": f"{type(e).__name__}: {e}"}
-                resumo_r = {"ok": False}
-            finally:
-                decisor.vazao_em = None
-            # qual interface carregava o tráfego enquanto essa sondagem rodou;
-            # é o que o dashboard do telemetry_server.py mostra como "em uso"
-            r["iface_ativa"] = iface == decisor.ativo
-            if fila:
-                fila.enfileirar(r)
-            decisor.medicao(iface, resumo_r, time.monotonic())
+        try:
+            for iface in ifaces:
+                agora = time.monotonic()
+                if not decisor.viva[iface]:
+                    # sem conexão também é observação: o link NÃO estava bom agora.
+                    # Não gasta o connect-timeout tentando sondar, mas registra
+                    # na telemetria, senão a queda nem aparece no dashboard.
+                    decisor.medicao(iface, {"ok": False, "motivo": "sem_conexao"}, agora)
+                    if fila:
+                        fila.enfileirar({"ts_utc": datetime.now(timezone.utc).isoformat(),
+                                         "rodada": rodada, "iface": iface, "host": host,
+                                         "erro": "sem_conexao",
+                                         "iface_ativa": iface == decisor.ativo})
+                    continue
+                # vazão é o que mais gasta dado: só a cada --tcp-every-s, e nunca
+                # num link que a sondagem anterior já mostrou degradado (só
+                # travaria esta thread até o timeout)
+                testa_tput = (args.tcp_every_s > 0 and not decisor.degrad[iface]
+                              and agora - ultimo_tput.get(iface, -1e12) >= args.tcp_every_s)
+                if testa_tput:
+                    ultimo_tput[iface] = agora
+                call_args = _ArgsView(args, args.tcp_bytes if testa_tput else 0)
+                decisor.vazao_em = iface if testa_tput else None
+                try:
+                    r = run_test(call_args, iface, rodada)
+                    resumo_r = resumo(r, tput_cache, iface, time.monotonic(),
+                                      1.5 * args.tcp_every_s)
+                except Exception as e:
+                    print(f"  ! {iface} falhou: {type(e).__name__}: {e}", file=sys.stderr)
+                    r = {"ts_utc": datetime.now(timezone.utc).isoformat(),
+                         "rodada": rodada, "iface": iface, "host": host,
+                         "erro": f"{type(e).__name__}: {e}"}
+                    resumo_r = {"ok": False}
+                finally:
+                    decisor.vazao_em = None
+                # qual interface carregava o tráfego enquanto essa sondagem rodou;
+                # é o que o dashboard do telemetry_server.py mostra como "em uso"
+                r["iface_ativa"] = iface == decisor.ativo
+                if fila:
+                    fila.enfileirar(r)
+                decisor.medicao(iface, resumo_r, time.monotonic())
 
-        st = decisor.status(time.monotonic())
-        print(f"[{rodada}] ativo={st['ativo']} alternativa={st['alternativa']}  " +
-              "  ".join(f"{i}=p{e['p']}/{e['p_cons']} n{e['n_eff']} {e['idade_s']}s"
-                        f"{'' if e['viva'] else ' MORTA'}"
-                        for i, e in st["estimativas"].items()))
-        log("status", rodada=rodada, **st)
+            st = decisor.status(time.monotonic())
+            print(f"[{rodada}] ativo={st['ativo']} alternativa={st['alternativa']}  " +
+                  "  ".join(f"{i}=p{e['p']}/{e['p_cons']} n{e['n_eff']} {e['idade_s']}s"
+                            f"{'' if e['viva'] else ' MORTA'}"
+                            for i, e in st["estimativas"].items()))
+            log("status", rodada=rodada, **st)
+        except Exception as e:
+            _erro_thread(log, "sondagem", e)
         time.sleep(args.interval)
 
 
-def enviar_telemetria(args) -> None:
+def enviar_telemetria(args, eventos: queue.Queue, log) -> None:
+    """Grava os eventos de decisão na fila (conexão sqlite própria desta
+    thread) e esvazia a fila; acorda assim que chega evento novo, senão a
+    cada 2 s."""
     from telemetry_client import Fila
     fila = Fila(args.telemetry_db, args.telemetry_url)
     while True:
-        fila.esvaziar()
-        time.sleep(2.0)
+        try:
+            try:
+                fila.enfileirar(eventos.get(timeout=2.0))
+                while not eventos.empty():
+                    fila.enfileirar(eventos.get_nowait())
+            except queue.Empty:
+                pass
+            fila.esvaziar()
+        except Exception as e:
+            _erro_thread(log, "telemetria", e)
+            time.sleep(2.0)
 
 
 def main():
@@ -528,7 +660,9 @@ def main():
                          "(interface sem gateway listado usa rota on-link, sem via)")
     ap.add_argument("--udp-port", type=int, default=5000)
     ap.add_argument("--tcp-port", type=int, default=5001)
-    ap.add_argument("--count", type=int, default=200, help="pacotes UDP por rodada")
+    # padrões de sondagem pensados pro custo de dado no celular; o engine
+    # imprime a estimativa de consumo ao iniciar (ver estimar_consumo)
+    ap.add_argument("--count", type=int, default=100, help="pacotes UDP por sondagem")
     ap.add_argument("--pps", type=float, default=100.0)
     ap.add_argument("--size", type=int, default=200)
     ap.add_argument("--resp-size", type=int, default=200)
@@ -538,13 +672,14 @@ def main():
                     help="timeout só do connect() TCP de cada sondagem completa")
     ap.add_argument("--server-iface", default=None)
     ap.add_argument("--tcp-bytes", type=int, default=2 * 1024 * 1024,
-                    help="bytes por sentido quando mede vazão (só a cada --tcp-every "
-                         "rodadas). Menor que o do agent_rpi de propósito: aqui só "
-                         "precisa estimar a ordem de grandeza, e um valor grande "
-                         "segura a thread de sondagem quando o link está ruim")
-    ap.add_argument("--tcp-every", type=int, default=5,
-                    help="mede vazão TCP a cada N rodadas por interface (0 desativa)")
-    ap.add_argument("--interval", type=float, default=5.0,
+                    help="bytes enviados (só subida) quando mede vazão. Menor que o "
+                         "do agent_rpi de propósito: aqui só precisa estimar a ordem "
+                         "de grandeza, e um valor grande segura a thread de sondagem "
+                         "quando o link está ruim")
+    ap.add_argument("--tcp-every-s", type=float, default=1800.0,
+                    help="mede vazão de subida no máximo a cada N segundos por "
+                         "interface (0 desativa). É o que mais gasta dado")
+    ap.add_argument("--interval", type=float, default=15.0,
                     help="pausa entre ciclos completos de sondagem (todas as interfaces)")
     # detecção rápida
     ap.add_argument("--hb-interval", type=float, default=0.5,
@@ -572,7 +707,7 @@ def main():
     ap.add_argument("--boa-tput-mbps", type=float, default=LIMITES_BOA["tput_mbps"])
     # política de troca
     ap.add_argument("--margin", type=float, default=0.15,
-                    help="quanto o p_cons do candidato precisa superar o da ativa "
+                    help="quanto o p_cons do candidato precisa superar o p da ativa "
                          "pra uma troca só por melhoria")
     ap.add_argument("--confirm-s", type=float, default=30.0,
                     help="por quanto tempo seguido a margem precisa se manter")
@@ -581,6 +716,12 @@ def main():
                          "falha em N sondagens completas seguidas => troca na hora, "
                          "sem margem/confirmação (0 desativa). Queda total é "
                          "detectada pelo heartbeat, independente disto")
+    ap.add_argument("--route-table-base", type=int, default=200,
+                    help="tabela de rota por política da i-ésima interface de "
+                         "--ifaces = base+i; o engine mantém essas tabelas e as "
+                         "`ip rule from <ip>` sozinho (0 desativa: aí é com você)")
+    ap.add_argument("--route-check-s", type=float, default=5.0,
+                    help="de quanto em quanto tempo confere/recoloca as rotas")
     ap.add_argument("--log", default="decisao.jsonl")
     ap.add_argument("--telemetry-url", default=None,
                     help="ex.: http://10.99.0.1:8080/telemetria; se informado, cada "
@@ -595,25 +736,45 @@ def main():
         print("aviso: sem root o SO_BINDTODEVICE e a troca de rota falham; use sudo.",
               file=sys.stderr)
 
-    # checa o roteamento antes de começar: sem isso, um erro de ip rule/tabela
-    # por interface ou gateway ausente só ia aparecer depois como timeout
-    # genérico na sondagem.
+    # monta as tabelas por interface e depois confere: um erro de ip rule /
+    # tabela ou gateway ausente só ia aparecer depois como timeout genérico.
+    for item in reconciliar_rotas(ifaces, gateways, args.route_table_base, None):
+        print(f"rotas: {item}", file=sys.stderr)
     for iface in ifaces:
         problema = checar_roteamento_politica(args.server, iface, gateways.get(iface))
         if problema:
             print(f"aviso: {iface}: {problema}", file=sys.stderr)
 
+    consumo = estimar_consumo(args, len(ifaces))
+    print(f"consumo estimado do engine POR interface: ~{consumo['total']} MB/dia "
+          f"(~{consumo['total'] * 30 / 1000:.1f} GB/mês): sondagem {consumo['sondagem']}, "
+          f"vazão {consumo['vazao']}, heartbeat {consumo['heartbeat']} MB/dia; "
+          f"ciclo ~{consumo['ciclo_s']} s", file=sys.stderr)
+
+    eventos = queue.Queue() if args.telemetry_url else None
+    host = socket.gethostname()
+
     with open(args.log, "a", buffering=1) as fh:
         lock_log = threading.Lock()
 
         def log(evento, **campos):
-            with lock_log:
-                log_line(fh, {"ts_utc": datetime.now(timezone.utc).isoformat(),
-                              "evento": evento, **campos})
+            reg = {"ts_utc": datetime.now(timezone.utc).isoformat(),
+                   "evento": evento, **campos}
+            try:
+                with lock_log:
+                    log_line(fh, reg)
+            except (OSError, ValueError) as e:
+                # disco cheio etc.: o failover continua, só sem log local
+                print(f"  ! falha gravando {args.log}: {e}", file=sys.stderr)
+            if eventos is not None:
+                # pro dashboard; as métricas cruas já vão como registro de sondagem
+                eventos.put({**{k: v for k, v in reg.items() if k != "entradas"},
+                             "host": host})
             if evento != "status":
                 print(f"  * {evento} " + " ".join(
                     f"{k}={campos[k]}" for k in ("iface", "de", "para", "motivo",
-                                                 "deteccao_s", "adiada_s", "troca_rota_ms")
+                                                 "deteccao_s", "adiada_s", "troca_rota_ms",
+                                                 "itens")
                     if k in campos), file=sys.stderr)
 
         decisor = Decisor(
@@ -625,13 +786,16 @@ def main():
             max_idade_s=args.max_age, espera_alt_ruim_s=args.bad_alt_grace)
         hb = Heartbeat(ifaces, args.server, args.udp_port, args.hb_timeout, args.hb_recover)
 
+        log("inicio", ifaces=ifaces, consumo_estimado_mb_dia=consumo,
+            config={k: v for k, v in vars(args).items() if k != "telemetry_url"})
         threading.Thread(target=sondar, args=(args, ifaces, decisor, log),
                          daemon=True, name="sondagem").start()
         if args.telemetry_url:
-            threading.Thread(target=enviar_telemetria, args=(args,),
+            threading.Thread(target=enviar_telemetria, args=(args, eventos, log),
                              daemon=True, name="telemetria").start()
 
         print(f"engine de decisão, interfaces: {ifaces}", file=sys.stderr)
+        prox_rotas, viva_ant, erros_rotas_ant = 0.0, None, None
         while True:
             fim = time.monotonic() + args.hb_interval
             hb.enviar(time.monotonic())
@@ -643,8 +807,21 @@ def main():
                 vida[i] = {"carrier": carrier_ok(i), "hb_rtt_ms": v.rtt_ms,
                            "sem_resposta_ha_s": None if v.ultima is None
                            else round(agora - v.ultima, 3)}
-            decisor.passo({i: vida[i]["carrier"] and hb.vida[i].viva(agora) for i in ifaces},
-                          agora, vida)
+            viva = {i: vida[i]["carrier"] and hb.vida[i].viva(agora) for i in ifaces}
+            decisor.passo(viva, agora, vida)
+            # periódico, e na hora em que alguma interface cai/volta (é quando
+            # o kernel costuma ter apagado rota). Roda nesta thread, a mesma que
+            # troca a rota: não tem como reaplicar uma ativa velha por corrida.
+            if agora >= prox_rotas or viva != viva_ant:
+                prox_rotas, viva_ant = agora + args.route_check_s, viva
+                corrigido = reconciliar_rotas(ifaces, gateways, args.route_table_base,
+                                              decisor.ativo)
+                # correção feita sai sempre (repetida = algo, tipo NetworkManager,
+                # brigando pelas rotas); a MESMA lista só de erros, uma vez só
+                so_erros = bool(corrigido) and all("erro" in c for c in corrigido)
+                if corrigido and not (so_erros and corrigido == erros_rotas_ant):
+                    log("rotas_reaplicadas", ativo=decisor.ativo, itens=corrigido)
+                erros_rotas_ant = corrigido if so_erros else None
 
 
 if __name__ == "__main__":
