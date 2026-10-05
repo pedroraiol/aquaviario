@@ -8,7 +8,9 @@ e serve um painel HTML somente-leitura. Roda ao lado do
 reflector_server.py, mas são coisas diferentes: o reflector mede o enlace,
 este aqui guarda o que foi medido.
 
-    POST /telemetria   corpo = um registro JSON (um round de um agente)
+    POST /telemetria   corpo = um registro JSON: uma sondagem (agente/engine)
+                       ou, se tiver a chave "evento", um evento de decisão do
+                       decision_engine.py (failover, interface caiu, status...)
     GET  /telemetria    últimos registros em JSON (?limit=&iface=)
     GET  /              dashboard HTML (recarrega sozinho só enquanto há dado novo)
     GET  /saude         health check pro Pi testar antes de esvaziar a fila
@@ -61,21 +63,42 @@ def init_db(path: str) -> None:
     colunas = {r[1] for r in con.execute("PRAGMA table_info(telemetria)")}
     if "iface_ativa" not in colunas:
         con.execute("ALTER TABLE telemetria ADD COLUMN iface_ativa INTEGER")
+    # quando FOI MEDIDO (ts_utc do Pi). recebido_em é quando chegou: depois de
+    # uma queda, o store-and-forward entrega o atraso todo de uma vez
+    if "medido_em" not in colunas:
+        con.execute("ALTER TABLE telemetria ADD COLUMN medido_em TEXT")
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS eventos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            recebido_em TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+            medido_em TEXT, host TEXT, evento TEXT, payload TEXT NOT NULL
+        )
+    """)
     con.commit()
     con.close()
 
 
 def inserir(db_path: str, registro: dict) -> None:
+    if not isinstance(registro, dict):
+        raise ValueError("registro precisa ser um objeto JSON")
+    if "evento" in registro:
+        with DB_LOCK, closing(sqlite3.connect(db_path)) as con, con:
+            con.execute("INSERT INTO eventos (medido_em, host, evento, payload) "
+                        "VALUES (?, ?, ?, ?)",
+                        (registro.get("ts_utc"), registro.get("host"),
+                         str(registro["evento"]), json.dumps(registro, ensure_ascii=False)))
+        return
     u = registro.get("udp", {}) or {}
     iface_ativa = registro.get("iface_ativa")  # só existe vindo do decision_engine.py
     with DB_LOCK, closing(sqlite3.connect(db_path)) as con, con:
         con.execute(
             """INSERT INTO telemetria
-               (host, iface, rodada, rtt_p50_ms, jitter_ms,
+               (medido_em, host, iface, rodada, rtt_p50_ms, jitter_ms,
                 perda_ida_pct, perda_volta_pct, perda_total_pct,
                 tcp_up_mbps, tcp_down_mbps, iface_ativa, erro, payload)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
+                registro.get("ts_utc"),
                 registro.get("host"), registro.get("iface"), registro.get("rodada"),
                 (u.get("rtt_ms") or {}).get("p50"), u.get("jitter_rtt_ms"),
                 u.get("perda_ida_pct"), u.get("perda_volta_pct"), u.get("perda_total_pct"),
@@ -115,6 +138,38 @@ def idade_ultimo_registro_s(db_path: str) -> float | None:
     return (datetime.now(timezone.utc) - ts).total_seconds()
 
 
+def ultimos_eventos(db_path: str, limit: int) -> list[dict]:
+    """Eventos de decisão mais recentes, sem os `status` periódicos."""
+    with closing(sqlite3.connect(db_path)) as con:
+        rows = con.execute(
+            "SELECT medido_em, host, payload FROM eventos WHERE evento != 'status' "
+            "ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+    return [{"medido_em": m, "host": h, **json.loads(p)} for m, h, p in rows]
+
+
+def ultimo_status(db_path: str) -> dict | None:
+    """Último `status` do engine: ativa, alternativa e estimativas."""
+    with closing(sqlite3.connect(db_path)) as con:
+        row = con.execute("SELECT payload FROM eventos WHERE evento = 'status' "
+                          "ORDER BY id DESC LIMIT 1").fetchone()
+    return json.loads(row[0]) if row else None
+
+
+def _epoch(ts: str | None) -> float | None:
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _hora(ts: str | None) -> str:
+    """'2026-10-05T14:03:07.123+00:00' -> '2026-10-05 14:03:07' (UTC)."""
+    e = _epoch(ts)
+    return "" if e is None else datetime.fromtimestamp(e, timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
 def interface_ativa(db_path: str) -> dict | None:
     """A interface marcada como ativa no registro mais recente que veio com
     essa informação (só o decision_engine.py manda `iface_ativa`; rodando o
@@ -135,21 +190,21 @@ def _cores_por_iface(ifaces: list[str]) -> dict[str, str]:
     return {iface: i for i, iface in enumerate(sorted(ifaces))}
 
 
-def _serie_por_iface(linhas_cron: list[dict], campo: str) -> dict[str, list[tuple[int, float]]]:
-    """linhas_cron: mais antiga primeiro. Agrupa por iface, pulando None (erro
-    na rodada ou métrica que só é medida de vez em quando, como vazão).
+def _serie_por_iface(linhas_cron: list[dict], campo: str) -> dict[str, list[tuple[float, float]]]:
+    """linhas_cron: mais antiga primeiro. Agrupa por iface, pulando None (erro,
+    interface sem conexão, ou métrica que só é medida de vez em quando, como vazão).
 
-    Usa o número da rodada como eixo x (não a posição na lista): a rodada é
-    compartilhada entre interfaces no mesmo ciclo, então alinha os pontos de
-    ifaces diferentes que aconteceram juntos, E deixa `_grafico_svg` enxergar
-    rodadas puladas (ex.: vazão só medida a cada --tcp-every) como o que são
-    -- uma lacuna real, não intervalo entre pontos de outro iface intercalado."""
-    out: dict[str, list[tuple[int, float]]] = defaultdict(list)
+    Eixo x = instante da MEDIÇÃO (ts_utc do Pi; recebido_em só pra registro
+    antigo, sem medido_em). Não a rodada: ela recomeça em 1 quando o engine
+    reinicia e embaralhava execuções diferentes. E não o horário de chegada:
+    o atraso de uma queda chega todo junto. Assim uma queda aparece como
+    lacuna no gráfico, que é o que ela foi."""
+    out: dict[str, list[tuple[float, float]]] = defaultdict(list)
     for r in linhas_cron:
         v = r.get(campo)
-        rodada = r.get("rodada")
-        if v is not None and rodada is not None:
-            out[r["iface"]].append((rodada, v))
+        x = _epoch(r.get("medido_em") or r.get("recebido_em"))
+        if v is not None and x is not None and r.get("iface"):
+            out[r["iface"]].append((x, v))
     for pts in out.values():
         pts.sort(key=lambda p: p[0])
     return dict(out)
@@ -159,20 +214,19 @@ def _num(v: float) -> str:
     return f"{v:.3g}"
 
 
-def _segmentos_continuos(pts: list[tuple[int, float]]) -> list[list[tuple[int, float]]]:
-    """Quebra em blocos só onde o salto de rodada foge do cadenciamento normal
-    dessa série. Uma métrica como vazão não é medida toda rodada por natureza
-    (--tcp-every), então o espaçamento "normal" dela pode ser 3, 5 rodadas...
-    o corte é pra pulo INESPERADO (bem maior que esse passo normal, ex.: uma
-    medição agendada que não rolou por link degradado, ou erro), não pra
-    distância que já é regra do jeito que a métrica é coletada."""
+def _segmentos_continuos(pts: list[tuple[float, float]]) -> list[list[tuple[float, float]]]:
+    """Quebra em blocos só onde o intervalo entre medições foge do ritmo normal
+    dessa série. Vazão é medida bem mais espaçada que RTT, então o "normal"
+    é por série: a MEDIANA dos intervalos (a duração de um ciclo varia, ex.
+    quando tem teste de vazão; o mínimo cortava à toa). O corte é pra pulo
+    INESPERADO (queda, sondagem que falhou), não pro ritmo da própria métrica."""
     if not pts:
         return []
     if len(pts) == 1:
         return [pts]
     passos = [b[0] - a[0] for a, b in zip(pts, pts[1:])]
-    passo_normal = min(passos)
-    limite = passo_normal * 1.5
+    passo_normal = sorted(passos)[len(passos) // 2]
+    limite = passo_normal * 2.5
     blocos = [[pts[0]]]
     for prox, passo in zip(pts[1:], passos):
         if passo > limite:
@@ -233,7 +287,8 @@ def _grafico_svg(titulo: str, unidade: str, series: dict[str, list[tuple[int, fl
         for x, y in pts:
             partes.append(
                 f'<circle cx="{sx(x):.1f}" cy="{sy(y):.1f}" r="9" class="alvo-hover">'
-                f'<title>{html.escape(iface)}: {_num(y)} {html.escape(unidade)} (rodada {x})</title></circle>'
+                f'<title>{html.escape(iface)}: {_num(y)} {html.escape(unidade)} '
+                f'({datetime.fromtimestamp(x, timezone.utc).strftime("%H:%M:%S")} UTC)</title></circle>'
             )
         ux, uy = pts[-1]
         partes.append(
@@ -254,7 +309,7 @@ def _grafico_svg(titulo: str, unidade: str, series: dict[str, list[tuple[int, fl
     return f"""<div class="grafico">
 <h3>{html.escape(titulo)} <span class="unidade">({html.escape(unidade)})</span></h3>
 {legenda}
-<svg viewBox="0 0 {largura} {altura}" class="svg-grafico" role="img" aria-label="{html.escape(titulo)} por rodada">
+<svg viewBox="0 0 {largura} {altura}" class="svg-grafico" role="img" aria-label="{html.escape(titulo)} no tempo">
 {"".join(partes)}
 </svg>
 </div>"""
@@ -265,11 +320,30 @@ def dashboard_html(db_path: str) -> str:
     idade = idade_ultimo_registro_s(db_path)
     recebendo_dados = idade is not None and idade < ATIVO_JANELA_S
     iface_ativa_info = interface_ativa(db_path)
+    status_engine = ultimo_status(db_path)
+    eventos = ultimos_eventos(db_path, 15)
 
     linhas_cron = list(reversed(linhas))          # mais antiga primeiro, pros gráficos
-    slot_por_iface = _cores_por_iface({r["iface"] for r in linhas_cron if r.get("iface")})
+    slot_por_iface = _cores_por_iface(
+        {r["iface"] for r in linhas_cron if r.get("iface")}
+        | set((status_engine or {}).get("estimativas", {})))
 
-    if iface_ativa_info:
+    def cor_de(iface):
+        slot = slot_por_iface.get(iface)
+        return f"var(--series-{slot % 8 + 1})" if slot is not None else "var(--texto)"
+
+    if status_engine and status_engine.get("ativo"):
+        # o status do engine é a fonte certa: diz a ativa E a alternativa
+        alt = status_engine.get("alternativa")
+        banner_ativa = (
+            '<div class="banner-ativa">interface em uso: '
+            f'<strong style="color:{cor_de(status_engine["ativo"])}">'
+            f'{html.escape(status_engine["ativo"])}</strong>, alternativa: '
+            + (f'<strong style="color:{cor_de(alt)}">{html.escape(alt)}</strong>' if alt else "nenhuma")
+            + f' <span class="banner-ativa-detalhe">(host {html.escape(status_engine.get("host") or "?")}, '
+            f'medido em {html.escape(_hora(status_engine.get("ts_utc")))} UTC)</span></div>'
+        )
+    elif iface_ativa_info:
         slot = slot_por_iface.get(iface_ativa_info["iface"])
         cor = f"var(--series-{slot % 8 + 1})" if slot is not None else "var(--texto)"
         banner_ativa = (
@@ -300,8 +374,51 @@ def dashboard_html(db_path: str) -> str:
     def cel(v):
         return "" if v is None else html.escape(str(v))
 
+    estimativas = ""
+    if status_engine and status_engine.get("estimativas"):
+        linhas_est = "".join(
+            f'<tr><td style="color:{cor_de(i)}">{html.escape(i)}</td>'
+            f"<td>{cel(e.get('p'))}</td><td>{cel(e.get('p_cons'))}</td>"
+            f"<td>{cel(e.get('n_eff'))}</td><td>{cel(e.get('idade_s'))}</td>"
+            f"<td>{'sim' if e.get('viva') else '<b>NÃO</b>'}</td>"
+            f"<td>{'sim' if e.get('desatualizada') else ''}</td></tr>"
+            for i, e in sorted(status_engine["estimativas"].items()))
+        estimativas = (
+            "<h3>Estimativas do engine</h3>"
+            "<p class=\"nota\">p = probabilidade estimada de a interface estar boa; "
+            "p_cons = estimativa pessimista (é a que ordena); n_eff = sondagens que "
+            "ainda pesam; idade = segundos desde a última medição.</p>"
+            "<table><tr><th>iface</th><th>p</th><th>p_cons</th><th>n_eff</th>"
+            f"<th>idade s</th><th>viva</th><th>desatualizada</th></tr>{linhas_est}</table>")
+
+    def resumo_evento(ev):
+        partes = []
+        if ev.get("de") or ev.get("para"):
+            partes.append(f"{ev.get('de')} → {ev.get('para')}")
+        elif ev.get("iface"):
+            partes.append(str(ev["iface"]))
+        for k in ("motivo", "gatilho", "deteccao_s", "adiada_s", "troca_rota_ms",
+                  "duracao_s", "thread", "erro"):
+            if ev.get(k) is not None:
+                partes.append(f"{k}={ev[k]}")
+        if ev.get("itens"):
+            partes.append("; ".join(map(str, ev["itens"])))
+        return html.escape("  ".join(partes))
+
+    lista_eventos = ""
+    if eventos:
+        lista_eventos = (
+            "<h3>Eventos de decisão recentes</h3><table>"
+            "<tr><th>medido (UTC)</th><th>host</th><th>evento</th><th>detalhe</th></tr>"
+            + "".join(f"<tr><td>{cel(_hora(ev.get('medido_em')))}</td><td>{cel(ev.get('host'))}</td>"
+                      f"<td>{cel(ev.get('evento'))}</td>"
+                      f"<td style=\"text-align:left\">{resumo_evento(ev)}</td></tr>"
+                      for ev in eventos)
+            + "</table>")
+
     trs = "\n".join(
-        f"<tr><td>{cel(r['recebido_em'])}</td><td>{cel(r['host'])}</td>"
+        f"<tr><td>{cel(_hora(r.get('medido_em')))}</td><td>{cel(r['recebido_em'])}</td>"
+        f"<td>{cel(r['host'])}</td>"
         f"<td>{cel(r['iface'])}</td>"
         f"<td class=\"marca-ativa\">{'X' if r.get('iface_ativa') == 1 else ''}</td>"
         f"<td>{cel(r['rodada'])}</td>"
@@ -369,17 +486,21 @@ h1, h3 {{ color: var(--texto); }}
 .banner-ativa-detalhe {{ color: var(--texto-mudo); font-size: 0.85rem; }}
 .banner-ativa-vazio {{ color: var(--texto-mudo); font-size: 0.85rem; }}
 .marca-ativa {{ text-align: center; }}
+.nota {{ color: var(--texto-mudo); font-size: 0.85rem; }}
+.secao {{ margin-bottom: 2rem; }}
 </style></head>
 <body>
 <h1>aquaviario: últimos registros recebidos</h1>
 {banner_ativa}
 <p>{status}, {len(linhas)} registros mostrados (gráficos em ordem cronológica, tabela mais recente primeiro)
 <a href="/">atualizar</a></p>
+<div class="secao">{estimativas}</div>
+<div class="secao">{lista_eventos}</div>
 <div class="grade-graficos">
 {graficos}
 </div>
 <table>
-<tr><th>recebido</th><th>host</th><th>iface</th><th>ativa</th><th>rodada</th>
+<tr><th>medido (UTC)</th><th>recebido</th><th>host</th><th>iface</th><th>ativa</th><th>rodada</th>
 <th>rtt p50 ms</th><th>jitter ms</th><th>perda ida %</th><th>perda volta %</th>
 <th>tcp up mbps</th><th>tcp down mbps</th><th>erro</th></tr>
 {trs}
@@ -415,11 +536,10 @@ class Handler(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(n)
         try:
-            registro = json.loads(body)
-        except json.JSONDecodeError:
+            inserir(self.server.db_path, json.loads(body))
+        except ValueError:            # JSON inválido (JSONDecodeError é ValueError) ou não-objeto
             self._send(400, b"json invalido", "text/plain")
             return
-        inserir(self.server.db_path, registro)
         self._send(200, b"ok", "text/plain")
 
     def _send(self, code, body, ctype):
