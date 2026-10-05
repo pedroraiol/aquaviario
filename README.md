@@ -358,11 +358,19 @@ nenhuma das duas atrasa a decisão.
 
 | motivo | gatilho | espera |
 |---|---|---|
-| `ativa_caida` | ativa morta (heartbeat/portadora) | nenhuma: vai para a alternativa pré-selecionada |
+| `ativa_caida` | ativa morta (heartbeat/portadora) | nenhuma: vai para a alternativa pré-selecionada (exceção abaixo) |
 | `degradacao_confirmada` | ativa com perda > 20 % ou RTT > 300 ms em `--fail-fast-rounds` (2) sondagens completas seguidas | nenhuma, para a melhor viva cuja última sondagem não está degradada |
 | `melhoria_qualidade` | `p_cons` do candidato ≥ `p` da ativa + `--margin` (0,15) | `--confirm-s` (30 s) seguidos, e só com medição atualizada |
 | `recuperacao_apos_queda_total` | nenhuma estava viva e uma voltou | nenhuma |
 
+- **Alternativa ruim:** se a ativa era boa, a melhor alternativa *não* é
+  boa (`p_cons` < 0,5) e quem detectou a queda foi o heartbeat, a engine
+  espera mais `--bad-alt-grace` (3 s) antes de trocar. Um silêncio curto
+  (handover de 4G/5G) jogaria o tráfego num link ruim, e voltar custa
+  `--confirm-s`. Se a ativa voltar nesse meio-tempo, nada troca, e o log
+  registra `troca_adiada` e `queda_curta_absorvida` com a duração. Esses
+  dois eventos servem para calibrar `--hb-timeout` e `--bad-alt-grace` no
+  campo. Queda de portadora troca na hora, porque aí a queda é certa.
 - **Nenhuma interface viva:** a rota fica como está (não há para onde ir; a
   telemetria espera na fila local), o log registra `sem_interface_disponivel`
   uma vez, e a engine troca para a primeira interface que voltar.

@@ -25,6 +25,10 @@ Três fluxos independentes, pra nenhum travar o outro:
 Política de troca:
   - ativa MORTA (sem portadora ou sem heartbeat há --hb-timeout): troca na
     hora pra alternativa pré-selecionada (a 1ª do ranking entre as vivas).
+    Exceção: se a ativa era boa, a alternativa NÃO é boa e o gatilho foi o
+    heartbeat (não a portadora), espera mais --bad-alt-grace segundos. Um
+    soluço de poucos segundos (handover) jogaria o tráfego num link ruim, e
+    voltar custa --confirm-s; se a ativa voltar nesse meio tempo, nada troca.
   - ativa DEGRADADA (perda>20% ou RTT ruim) em --fail-fast-rounds sondagens
     completas seguidas: troca na hora pra melhor viva cuja última sondagem
     não está degradada.
@@ -305,11 +309,12 @@ class Decisor:
 
     def __init__(self, ifaces, trocar_rota, log, *, limites=LIMITES_BOA,
                  meia_vida_s=MEIA_VIDA_S, margem=0.15, confirmacao_s=30.0,
-                 degrad_seguidas=2, max_idade_s=90.0):
+                 degrad_seguidas=2, max_idade_s=90.0, espera_alt_ruim_s=3.0):
         self.ifaces = list(ifaces)
         self.trocar_rota, self.log = trocar_rota, log
         self.limites, self.margem, self.confirmacao_s = limites, margem, confirmacao_s
         self.degrad_seguidas, self.max_idade_s = degrad_seguidas, max_idade_s
+        self.espera_alt_ruim_s = espera_alt_ruim_s
         self.est = {i: Estimativa(meia_vida_s) for i in ifaces}
         self.degrad = {i: 0 for i in ifaces}     # sondagens completas seguidas degradadas
         self.ultima = {i: None for i in ifaces}  # último resumo + violações
@@ -318,6 +323,8 @@ class Decisor:
         self.alternativa = None
         self.desafiante, self.desafiante_desde = None, None
         self.sem_link = False                    # ninguém vivo
+        self.ativa_caiu_em = None                # quando a ativa foi declarada morta
+        self.adiada = False                      # troca segurada por alternativa ruim
         self.alguma_boa = None
         self.vazao_em = None                     # teste de vazão rodando agora (só pro log)
         self.falha_troca: dict = {}
@@ -365,18 +372,38 @@ class Decisor:
             if self.sem_link and self.ativo is not None and viva[self.ativo]:
                 self.sem_link = False
                 self.log("conexao_restabelecida", iface=self.ativo, **ctx)
+            if self.ativo is not None and viva[self.ativo] and self.ativa_caiu_em is not None:
+                if self.adiada:
+                    # dado pra calibrar --hb-timeout/--bad-alt-grace no campo
+                    self.log("queda_curta_absorvida", iface=self.ativo,
+                             duracao_s=round(agora - self.ativa_caiu_em, 1), **ctx)
+                self.ativa_caiu_em, self.adiada = None, False
 
             if self.ativo is None:
                 # partida: empate (ninguém medido ainda) fica com a ordem de --ifaces
                 if ranking:
                     self._trocar(ranking[0], "ativacao_inicial", agora, ctx)
             elif not viva[self.ativo]:
-                if alt:
+                if self.ativa_caiu_em is None:
+                    self.ativa_caiu_em = agora
+                v = (vida or {}).get(self.ativo) or {}
+                portadora = v.get("carrier") is False
+                # ativa boa caiu e a alternativa é ruim: segura um pouco (ver docstring).
+                # Sem portadora a queda é certa, não espera.
+                esperar = (alt and not portadora and not self.sem_link
+                           and est[alt[0]]["p_cons"] < P_BOA <= est[self.ativo]["p_cons"]
+                           and agora - self.ativa_caiu_em < self.espera_alt_ruim_s)
+                if esperar:
+                    if not self.adiada:
+                        self.adiada = True
+                        self.log("troca_adiada", de=self.ativo, para=alt[0],
+                                 espera_s=self.espera_alt_ruim_s, **ctx)
+                elif alt:
                     motivo = "recuperacao_apos_queda_total" if self.sem_link else "ativa_caida"
-                    v = (vida or {}).get(self.ativo) or {}
                     self._trocar(alt[0], motivo, agora, ctx,
                                  deteccao_s=v.get("sem_resposta_ha_s"),
-                                 gatilho="portadora" if v.get("carrier") is False else "heartbeat")
+                                 gatilho="portadora" if portadora else "heartbeat",
+                                 adiada_s=round(agora - self.ativa_caiu_em, 1) if self.adiada else None)
                 elif not self.sem_link:
                     self.sem_link = True
                     self.log("sem_interface_disponivel", ativo=self.ativo, **ctx)
@@ -424,6 +451,7 @@ class Decisor:
         self.ativo = para
         self.desafiante = None
         self.sem_link = False
+        self.ativa_caiu_em, self.adiada = None, False
         self.log("ativacao_inicial" if motivo == "ativacao_inicial" else "failover",
                  para_boa=ctx["estimativas"][para]["p_cons"] >= P_BOA, **campos)
 
@@ -525,6 +553,10 @@ def main():
                     help="sem resposta do heartbeat por isso => interface morta. "
                          "Calibrar no campo: handover de 4G/5G pode calar o link por "
                          "~1 s sem ele ter caído")
+    ap.add_argument("--bad-alt-grace", type=float, default=3.0,
+                    help="segundos a mais que a ativa (boa) pode ficar sem heartbeat "
+                         "antes de trocar, quando a melhor alternativa NÃO é boa "
+                         "(p_cons<0,5). Não vale pra queda de portadora. 0 desativa")
     ap.add_argument("--hb-recover", type=int, default=3,
                     help="respostas seguidas pra uma interface morta voltar a ser elegível")
     # modelo de qualidade
@@ -581,7 +613,7 @@ def main():
             if evento != "status":
                 print(f"  * {evento} " + " ".join(
                     f"{k}={campos[k]}" for k in ("iface", "de", "para", "motivo",
-                                                 "deteccao_s", "troca_rota_ms")
+                                                 "deteccao_s", "adiada_s", "troca_rota_ms")
                     if k in campos), file=sys.stderr)
 
         decisor = Decisor(
@@ -590,7 +622,7 @@ def main():
                      "jitter_ms": args.boa_jitter_ms, "tput_mbps": args.boa_tput_mbps},
             meia_vida_s=args.half_life, margem=args.margin,
             confirmacao_s=args.confirm_s, degrad_seguidas=args.fail_fast_rounds,
-            max_idade_s=args.max_age)
+            max_idade_s=args.max_age, espera_alt_ruim_s=args.bad_alt_grace)
         hb = Heartbeat(ifaces, args.server, args.udp_port, args.hb_timeout, args.hb_recover)
 
         threading.Thread(target=sondar, args=(args, ifaces, decisor, log),

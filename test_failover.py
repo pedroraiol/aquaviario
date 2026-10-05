@@ -35,6 +35,7 @@ class Sim:
         self.t, self.ciclo, self.hb = 0.0, ciclo, hb
         self.eventos, self.rotas = [], []
         self.viva = {i: True for i in ifaces}
+        self.carrier = {i: True for i in ifaces}
         self.qual = {i: BOA for i in ifaces}
         self.medir = {i: True for i in ifaces}     # False = sondagem "travada"
         self.prox = ciclo
@@ -59,7 +60,8 @@ class Sim:
                     a = {"ok": False, "motivo": "sem_conexao"} if not self.viva[i] else (
                         q() if callable(q) else q)
                     self.d.medicao(i, a, self.t)
-            self.d.passo(dict(self.viva), self.t)
+            self.d.passo({i: self.viva[i] and self.carrier[i] for i in self.viva}, self.t,
+                         {i: {"carrier": c} for i, c in self.carrier.items()})
 
     def trocas(self, desde=0.0):
         return [(t, c["para"], c["motivo"]) for t, ev, c in self.eventos
@@ -199,6 +201,42 @@ def test_falha_ao_trocar_rota_nao_vira_spam():
     s.rodar(20)
     falhas = [e for e in s.eventos if e[1] == "failover_falhou"]
     assert 3 <= len(falhas) <= 5, len(falhas)            # 1 tentativa a cada 5 s
+
+
+def test_soluco_com_alternativa_ruim_nao_troca():
+    s = Sim(["a", "b"])
+    s.qual["b"] = MEDIOCRE
+    s.rodar(300)
+    s.viva["a"] = False          # handover: 2 s mudo (já descontado o --hb-timeout)
+    s.rodar(2)
+    s.viva["a"] = True
+    s.rodar(60)
+    assert s.trocas() == [] and s.d.ativo == "a", s.trocas()
+    ev = [e[1] for e in s.eventos]
+    assert "troca_adiada" in ev and "queda_curta_absorvida" in ev
+
+
+def test_queda_longa_com_alternativa_ruim_troca_apos_espera():
+    s = Sim(["a", "b"])
+    s.qual["b"] = MEDIOCRE
+    s.rodar(300)
+    s.viva["a"] = False
+    t0 = s.t
+    s.rodar(10)
+    tr = s.trocas(t0)
+    # declarada morta no 1º passo (t0+0,5), troca 3 s (--bad-alt-grace) depois
+    assert tr == [(t0 + 0.5 + 3.0, "b", "ativa_caida")], tr
+
+
+def test_queda_de_portadora_nao_espera():
+    s = Sim(["a", "b"])
+    s.qual["b"] = MEDIOCRE
+    s.rodar(300)
+    s.carrier["a"] = False
+    t0 = s.t
+    s.rodar(1)
+    assert s.trocas(t0) == [(t0 + 0.5, "b", "ativa_caida")], s.trocas(t0)
+    assert "troca_adiada" not in [e[1] for e in s.eventos]
 
 
 def test_vida_heartbeat():
